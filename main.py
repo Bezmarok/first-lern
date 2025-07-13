@@ -1,141 +1,114 @@
-# main.py — Telegram бот для распределения заявок доставки через Google Sheets
 
+import logging
 import os
 import json
-import logging
-import gspread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler
-)
-from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
 
-# 🔧 Настройка логов
-logging.basicConfig(level=logging.INFO)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# 🛠️ Глобальные переменные
-drivers = {}
-assignments = {}
-ADMIN_USERNAME = "ник_1"  # Заменить на username администратора Telegram
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# 🔐 Авторизация через GOOGLE_CREDENTIALS из Railway
+# Настройка логов
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+
+# Загрузка переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_CREDS_RAW = os.getenv("GOOGLE_CREDENTIALS")
+
+# Парсинг JSON-ключа
+google_creds = json.loads(GOOGLE_CREDS_RAW)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-google_creds = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
 client = gspread.authorize(credentials)
-sheet = client.open("Cargodeliver").sheet1  # Заменить на имя вашей таблицы
 
-# 🚛 Команда /start — регистрация водителя
+# === НАСТРОЙКА ===
+SHEET_NAME = "Cargodeliver"  # ЗАМЕНИТЬ на фактическое имя таблицы
+ADMIN_USERNAME = "ник_1"         # ЗАМЕНИТЬ на телеграм-username админа без @
+
+# === СЛОВАРИ СОСТОЯНИЙ ===
+drivers_data = {}  # user_id: { "max_weight": ..., "max_volume": ..., "area": ... }
+assigned_requests = {}  # user_id: [строки таблицы]
+
+# === ОБРАБОТЧИК СТАРТА ДЛЯ ВОДИТЕЛЕЙ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    if user.username == ADMIN_USERNAME:
-        await update.message.reply_text("Привет, админ! Заявки будут распределяться автоматически.")
-    else:
-        await update.message.reply_text(
-            "Привет! Введи параметры через запятую:\n"
-            "Макс. объем (м³), макс. вес (кг), район доставки (например: ЮЗАО)"
-        )
+    await update.message.reply_text("Привет! Укажи максимальные параметры машины (габариты, вес) и район доставки через запятую.\nПример:\n`150х100х80, 500, ЮАО`", parse_mode="Markdown")
+    return
 
-# 🚙 Обработка параметров водителя
-async def handle_driver_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    text = update.message.text
+# === ПАРСИНГ ДАННЫХ ОТ ВОДИТЕЛЯ ===
+async def parse_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        size, weight, district = [x.strip() for x in text.split(",")]
-        drivers[chat_id] = {
-            "size": float(size),
-            "weight": float(weight),
-            "district": district,
-            "name": update.message.from_user.full_name
+        dims_str, weight_str, area = update.message.text.split(",")
+        drivers_data[update.effective_user.id] = {
+            "max_dims": dims_str.strip(),
+            "max_weight": float(weight_str.strip()),
+            "area": area.strip(),
         }
-        await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
-    except:
-        await update.message.reply_text("⚠️ Ошибка. Введите: объем, вес, район (через запятую).")
+        await update.message.reply_text("Спасибо! Теперь жди назначения заявок.")
+    except Exception:
+        await update.message.reply_text("Неверный формат. Повтори пример: `150х100х80, 500, ЮАО`", parse_mode="Markdown")
 
-# 📦 Форматирование текста заявки
-def build_order_message(row):
-    return (
-        f"🚚 Заявка №{row['№']}\n"
-        f"Дата: {row['Дата доставки']} {row['Время доставки']}\n"
-        f"Адрес: {row['Адрес доставки']}\n"
-        f"Клиент: {row['Телефон клиента']}\n"
-        f"Объем: {row['Объем заказа']} м³, Вес: {row['Вес заказа']} кг\n"
-        f"Оплата: {row['Способ оплаты']}\n"
-        f"Комментарий: {row['Комментарий']}"
-    )
+# === КНОПКИ В ЗАЯВКЕ ===
+def build_task_keyboard(addr: str):
+    yandex_url = f"https://yandex.ru/navi/?whatshere[point]={addr}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Выполнено", callback_data="done"),
+         InlineKeyboardButton("🔴 Не выполнено", callback_data="fail")],
+        [InlineKeyboardButton("🗺 Маршрут", url=yandex_url)]
+    ])
 
-# 🔎 Поиск подходящего водителя
-def match_driver(row):
-    for chat_id, driver in drivers.items():
-        if driver["district"].lower() in row["Адрес доставки"].lower():
-            if float(row["Объем заказа"]) <= driver["size"] and float(row["Вес заказа"]) <= driver["weight"]:
-                return chat_id
-    return None
-
-# 📤 Распределение заявок
+# === ПРИМЕР НАЗНАЧЕНИЯ ЗАДАЧ ===
 async def assign_tasks(context: ContextTypes.DEFAULT_TYPE):
-    rows = sheet.get_all_records()
-    for row in rows:
-        row_id = str(row["№"])
-        if row_id not in assignments:
-            chat_id = match_driver(row)
-            if chat_id:
-                msg = build_order_message(row)
-                keyboard = [
-                    [InlineKeyboardButton("🟢 Выполнено", callback_data=f"done_{row_id}"),
-                     InlineKeyboardButton("🔴 Не выполнено", callback_data=f"fail_{row_id}")],
-                    [InlineKeyboardButton("🧭 Маршрут", url=f"https://yandex.ru/maps/?text={row['Адрес доставки']}")]
-                ]
-                message = await context.bot.send_message(chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
-                assignments[row_id] = {
-                    "driver": chat_id,
-                    "status": "assigned",
-                    "message_id": message.message_id
-                }
+    sheet = client.open(SHEET_NAME).sheet1
+    rows = sheet.get_all_values()[1:]  # без заголовка
 
-# 🖱 Обработка кнопок
+    for user_id, driver in drivers_data.items():
+        # Здесь фильтрация по весу, объёму и району (упрощено)
+        suitable = [r for r in rows if float(r[9]) <= driver["max_weight"] and driver["area"] in r[11]]
+        assigned_requests[user_id] = suitable
+
+        for row in suitable:
+            text = f"📦 Заявка №{row[1]}\n🚚 Адрес: {row[11]}\n📞 Тел: {row[12]}\n💰 Оплата: {row[13]}"
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=build_task_keyboard(row[11]))
+            await asyncio.sleep(1)
+
+# === ОБРАБОТКА КНОПОК ===
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data.startswith("done_") or data.startswith("fail_"):
-        num = data.split("_")[1]
-        status = "done" if data.startswith("done_") else "fail"
-        assignments[num]["status"] = status
-        result = "✅ Выполнена" if status == "done" else "❌ Не выполнена"
-        await query.edit_message_text(f"Заявка №{num} — {result}")
+    data = update.callback_query.data
+    await update.callback_query.answer()
+    if data == "done":
+        await update.callback_query.edit_message_text(update.callback_query.message.text + "\n✅ Выполнено")
+    elif data == "fail":
+        await update.callback_query.edit_message_text(update.callback_query.message.text + "\n❌ Не выполнено")
 
-# 📊 Ежедневный отчёт администратору
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    summary = "📊 Ежедневный отчёт:\n"
-    for num, a in assignments.items():
-        name = drivers[a["driver"]]["name"]
-        status = "🟢" if a["status"] == "done" else "🔴" if a["status"] == "fail" else "⏳"
-        summary += f"{status} Заявка №{num} — {a['status']} (Водитель: {name})\n"
-    for admin in context.application.bot_data.get("admins", []):
-        await context.bot.send_message(admin, summary)
+# === ОТЧЁТ АДМИНУ ===
+async def send_admin_report(context: ContextTypes.DEFAULT_TYPE):
+    admin_id = (await context.bot.get_chat(ADMIN_USERNAME)).id
+    report = "📊 Ежедневный отчёт\n\n"
+    for uid, tasks in assigned_requests.items():
+        report += f"👤 Водитель {uid}: {len(tasks)} заявок\n"
+    await context.bot.send_message(chat_id=admin_id, text=report)
 
-# 🧠 Запуск бота
-async def main():
-    app = ApplicationBuilder().token(os.environ["BOT_TOKEN"]).build()
+# === ПЛАНИРОВЩИК ===
+async def scheduler(app: Application):
+    while True:
+        now = datetime.now()
+        if now.hour == 7 and now.minute == 0:
+            await assign_tasks(app)
+            await send_admin_report(app)
+        await asyncio.sleep(60)
 
+# === ЗАПУСК ===
+if __name__ == "__main__":
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_data))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, parse_driver_params))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Добавьте Telegram ID админа для получения отчётов
-    app.bot_data["admins"] = []
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(assign_tasks, "cron", hour=8, minute=0, args=[app])
-    scheduler.add_job(daily_report, "cron", hour=21, minute=0, args=[app])
-    scheduler.start()
-
-    print("🤖 Бот запущен")
-    await app.run_polling()
-
-if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduler(app))
     app.run_polling()
