@@ -26,7 +26,7 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 google_creds = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
 client = gspread.authorize(credentials)
-sheet = client.open("Имя вашей таблицы").sheet1  # Заменить на имя вашей таблицы
+sheet = client.open("Cargodeliver").sheet1  # Заменить на имя вашей таблицы
 
 # 🚛 Команда /start — регистрация водителя
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
