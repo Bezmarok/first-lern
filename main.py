@@ -14,7 +14,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- ЛОГИКА GOOGLE SHEETS ---
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
@@ -23,7 +23,7 @@ SHEET_NAME = "Cargodeliver"
 # --- ХРАНИЛИЩЕ ---
 drivers_data = {}
 assigned_requests = defaultdict(list)
-ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "123456789"))  # ← замени на ID админа
+ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "ник_1"))  # ← замени на ID админа
 
 # === СТАРТ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
