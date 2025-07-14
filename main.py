@@ -67,8 +67,9 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
         }
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
     except Exception:
-        await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, СПБ"),
-        parse_mode="Markdown")
+        await update.message.reply_text(("⚠️ Неверный формат. Пример: 2.5, 500, СПБ"),
+        parse_mode="Markdown"
+    )
 
 # === КНОПКИ ЗАЯВКИ ===
 def build_task_keyboard(addr: str):
