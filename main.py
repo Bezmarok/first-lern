@@ -46,19 +46,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Привет, админ! Нажми кнопку для распределения заявок:", reply_markup=reply_markup)
     else:
         await update.message.reply_text(
-            "Привет! Укажи параметры машины в формате:
-"
-            "`2.5, 500, СПБ`
-"
-            "где:
-"
-            "- 2.5 = объём в м³
-"
-            "- 500 = макс. вес в кг
-"
-            "- СПБ или СПБ + Область = зона доставки",
-            parse_mode="Markdown"
-        )
+    "Привет! Укажи параметры машины в формате:\n\n"
+    "`2.5, 500, СПБ`\n\n"
+    "*где:*\n"
+    "- 2.5 = объём в м³\n"
+    "- 500 = макс. вес в кг\n"
+    "- СПБ или СПБ + Область = зона доставки",
+    parse_mode="Markdown"
+)
 
 # === ПАРСИНГ ВОДИТЕЛЯ ===
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
