@@ -23,7 +23,7 @@ SHEET_NAME = "Cargodeliver"
 # --- ХРАНИЛИЩЕ ---
 drivers_data = {}
 assigned_requests = defaultdict(list)
-ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "никадм"))  # ← замени на ID админа
+ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "mister_RA"))  # ← замени на ID админа
 
 # === СТАРТ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
