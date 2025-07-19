@@ -18,12 +18,12 @@ creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
-SHEET_NAME = "Cargodeliver" 
+SHEET_NAME = "Cargodeliver"
 
 # --- ХРАНИЛИЩЕ ---
 drivers_data = {}
 assigned_requests = defaultdict(list)
-ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))  # ← замени на ID админа
+ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))  # ← замени на свой Telegram ID
 
 # === СТАРТ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,8 +62,8 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
 def build_task_keyboard(addr: str):
     yandex_url = f"https://yandex.ru/maps/?text={addr}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Выполнено", callback_data="done"),
-         InlineKeyboardButton("❌ Не выполнено", callback_data="fail")],
+        [InlineKeyboardButton("✅ Выполнено", callback_data=f"done|{addr}"),
+         InlineKeyboardButton("❌ Не выполнено", callback_data=f"fail|{addr}")],
         [InlineKeyboardButton("📍 Маршрут", url=yandex_url)]
     ])
 
@@ -74,16 +74,28 @@ async def distribute_tasks(bot):
 
     for user_id, driver in drivers_data.items():
         suitable = []
+        used_volume = 0
+        used_weight = 0
+
         for row in rows:
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
                 zone = row.get("Вид перевозки", "").lower()
-                if vol <= driver["volume"] and weight <= driver["weight"] and driver["zone"] in zone:
+
+                if (vol + used_volume <= driver["volume"] and
+                    weight + used_weight <= driver["weight"] and
+                    driver["zone"] in zone):
+
                     suitable.append(row)
+                    used_volume += vol
+                    used_weight += weight
+
             except Exception:
                 continue
+
         assigned_requests[user_id] = suitable
+
         for task in suitable:
             addr = task.get("Адрес доставки", "Без адреса")
             await bot.send_message(
@@ -104,7 +116,26 @@ async def send_daily_report(bot):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "refresh":
+
+    user_id = query.from_user.id
+    username = query.from_user.username or f"ID: {user_id}"
+
+    if query.data.startswith("done") or query.data.startswith("fail"):
+        status, addr = query.data.split("|", 1)
+        status_text = "выполнена ✅" if status == "done" else "не выполнена ❌"
+
+        # Уведомление админу
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"📨 Ответ от @{username}:\n"
+                f"Заявка по адресу:\n📍 {addr}\n"
+                f"Статус: {status_text}"
+            )
+        )
+        await query.edit_message_text(f"Заявка {status_text}.\nАдрес: {addr}")
+
+    elif query.data == "refresh":
         await distribute_tasks(context.bot)
         await query.edit_message_text("🔄 Заявки перераспределены!")
         await send_daily_report(context.bot)
