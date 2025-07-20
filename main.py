@@ -99,7 +99,6 @@ async def distribute_tasks(bot):
                 f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
                 f"💰 Сумма: {row.get('Стоимость заказа')}₽\n"
             )
-
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
