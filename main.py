@@ -70,7 +70,6 @@ def build_task_keyboard(addr: str, row_index: int):
 # === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
-    assigned_requests = {}
 
     for user_id, driver in drivers_data.items():
         total_vol = 0
@@ -79,7 +78,7 @@ async def distribute_tasks(bot):
         assigned_requests[user_id] = []
 
         for idx, row in enumerate(rows, start=2):
-            # Пропускаем, если заявка уже назначена или выполняется
+            # Пропускаем, если уже назначена или выполняется
             if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
                 continue
 
@@ -87,36 +86,34 @@ async def distribute_tasks(bot):
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
                 zone = row.get("Вид перевозки", "").lower()
+                driver_zone = driver["zone"].lower()
 
+                # Сравнение зон и проверка по объёму/весу
                 if (
                     vol + total_vol <= driver["volume"]
                     and weight + total_weight <= driver["weight"]
-                    and driver["zone"] in zone
+                    and (driver_zone in zone or zone in driver_zone)
                 ):
                     total_vol += vol
                     total_weight += weight
-
-                    # Обновление таблицы
-                    sheet.update(f"J{idx}", "выполняется")  # Статус
-                    sheet.update(f"K{idx}", username)      # Водитель
+                    sheet.update(f"J{idx}", "выполняется")
+                    sheet.update(f"K{idx}", username)
                     assigned_requests[user_id].append(idx)
 
-                    # Формирование текста заявки
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
-                        f"🗓 Дата/время: {row.get('План время дата')}\n"
-                        f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
-                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
+                        f"🕒 Дата/время: {row.get('План время дата')}\n"
+                        f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа')}₽\n"
                     )
-
-                    await bot.send_message(chat_id=user_id, text=text)
+                    await bot.send_message(user_id, text)
 
             except Exception as e:
-                print(f"Ошибка при обработке строки {idx}: {e}")
-                continue
+                print(f"❌ Ошибка при обработке строки {idx}: {e}")
 
+    await bot.send_message(admin_id, "✅ Заявки перераспределены!\n🧾 Отчёт по задачам:")
 
 # === ОТЧЁТ АДМИНУ ===
 async def send_daily_report(bot):
