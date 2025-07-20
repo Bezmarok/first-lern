@@ -70,41 +70,38 @@ def build_task_keyboard(addr: str, row_index: int):
 # === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
+    assigned_requests = {}
+
     for user_id, driver in drivers_data.items():
         total_vol = 0
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
+
         for idx, row in enumerate(rows, start=2):
+            # Пропускаем, если заявка уже назначена или выполняется
             if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
                 continue
 
-    try:
-        vol = float(row.get("Объем заказа", 0))
-        weight = float(row.get("Вес заказа", 0))
-        zone = row.get("Вид перевозки", "").lower()
+            try:
+                vol = float(row.get("Объем заказа", 0))
+                weight = float(row.get("Вес заказа", 0))
+                zone = row.get("Вид перевозки", "").lower()
 
-        if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
-            total_vol += vol
-            total_weight += weight
-            sheet.update(f"J{idx}", "выполняется")
-            sheet.update(f"K{idx}", username)
-            assigned_requests[user_id].append(idx)
-
-            addr = row.get("Адрес доставки", "Москва")
-            text = (
-                f"📦 Заявка:\n"
-                f"📍 Адрес: {addr}\n"
-                f"🕒 Дата/время: {row.get('План время дата')}\n"
-                f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
-                f"💰 Сумма: {row.get('Стоимость заказа')}₽\n"
-            )
-                if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
+                if (
+                    vol + total_vol <= driver["volume"]
+                    and weight + total_weight <= driver["weight"]
+                    and driver["zone"] in zone
+                ):
                     total_vol += vol
                     total_weight += weight
-                    sheet.update(f"T{idx}", "выполняется")
-                    sheet.update(f"U{idx}", username)
+
+                    # Обновление таблицы
+                    sheet.update(f"J{idx}", "выполняется")  # Статус
+                    sheet.update(f"K{idx}", username)      # Водитель
                     assigned_requests[user_id].append(idx)
+
+                    # Формирование текста заявки
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
@@ -113,13 +110,13 @@ async def distribute_tasks(bot):
                         f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
                         f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
                     )
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=text,
-                        reply_markup=build_task_keyboard(addr, idx)
-                    )
-            except Exception:
+
+                    await bot.send_message(chat_id=user_id, text=text)
+
+            except Exception as e:
+                print(f"Ошибка при обработке строки {idx}: {e}")
                 continue
+
 
 # === ОТЧЁТ АДМИНУ ===
 async def send_daily_report(bot):
