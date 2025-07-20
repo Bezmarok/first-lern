@@ -75,7 +75,7 @@ async def distribute_tasks(bot):
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
-        for idx, row in enumerate(rows, start=2):
+       for idx, row in enumerate(rows, start=2):
     if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
         continue
 
