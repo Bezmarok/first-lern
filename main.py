@@ -76,12 +76,30 @@ async def distribute_tasks(bot):
         username = driver["username"]
         assigned_requests[user_id] = []
         for idx, row in enumerate(rows, start=2):
-            if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
-                continue
-            try:
-                vol = float(row.get("Объем заказа", 0))
-                weight = float(row.get("Вес заказа", 0))
-                zone = row.get("Вид перевозки", "").lower()
+    if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
+        continue
+
+    try:
+        vol = float(row.get("Объем заказа", 0))
+        weight = float(row.get("Вес заказа", 0))
+        zone = row.get("Вид перевозки", "").lower()
+
+        if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
+            total_vol += vol
+            total_weight += weight
+            sheet.update(f"J{idx}", "выполняется")
+            sheet.update(f"K{idx}", username)
+            assigned_requests[user_id].append(idx)
+
+            addr = row.get("Адрес доставки", "Москва")
+            text = (
+                f"📦 Заявка:\n"
+                f"📍 Адрес: {addr}\n"
+                f"🕒 Дата/время: {row.get('План время дата')}\n"
+                f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
+                f"💰 Сумма: {row.get('Стоимость заказа')}₽\n"
+            )
+
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
