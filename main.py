@@ -77,7 +77,7 @@ async def distribute_tasks(bot):
         assigned_requests[user_id] = []
         for idx, row in enumerate(rows, start=2):
             if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
-    continue
+                continue
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
