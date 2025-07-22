@@ -20,7 +20,6 @@ client = gspread.authorize(creds)
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
-logging.basicConfig(level=logging.INFO)
 drivers_data = {}
 assigned_requests = defaultdict(list)
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
@@ -54,8 +53,7 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
             "username": username
         }
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
-    except Exception as e:
-        logging.warning(f"Ошибка парсинга параметров: {e}")
+    except Exception:
         await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, СПБ", parse_mode="Markdown")
 
 # === КНОПКИ ===
@@ -84,27 +82,19 @@ async def distribute_tasks(bot):
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
                 zone = row.get("Вид перевозки", "").lower()
-
-                logging.info(f"Проверка заявки {idx}: заявка зона='{zone}', водитель зона='{driver['zone']}'")
-                logging.info(f"\tОбъем: {vol}, Вес: {weight}, лимит: {driver['volume']}, {driver['weight']}")
-
-                if (vol + total_vol <= driver["volume"]
-                    and weight + total_weight <= driver["weight"]
-                    and (driver["zone"] in zone or zone in driver["zone"])):
-
+                if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
-                    sheet.update(f"J{idx}", "выполняется")
-                    sheet.update(f"K{idx}", username)
+                    sheet.update(f"T{idx}", [["выполняется"]])
+                    sheet.update(f"U{idx}", [[username]])
                     assigned_requests[user_id].append(idx)
-
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
                         f"🗓 Дата/время: {row.get('План время дата')}\n"
                         f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
-                        f"💰 Сумма: {row.get('Стоимость заказа, руб.') or 'не указана'}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
                     )
                     await bot.send_message(
                         chat_id=user_id,
@@ -112,7 +102,7 @@ async def distribute_tasks(bot):
                         reply_markup=build_task_keyboard(addr, idx)
                     )
             except Exception as e:
-                logging.warning(f"Ошибка при обработке строки {idx}: {e}")
+                logging.error(f"Ошибка при распределении строки {idx}: {e}")
                 continue
 
 # === ОТЧЁТ АДМИНУ ===
@@ -139,8 +129,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_index = int(row_index)
         status = "выполнено" if action == "done" else "не выполнено"
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.update(f"J{row_index}", status)
-        sheet.update(f"L{row_index}", now)
+        sheet.update(f"T{row_index}", [[status]])
+        sheet.update(f"V{row_index}", [[now]])
 
         addr = sheet.cell(row_index, 6).value or "адрес не указан"
         text = (
@@ -154,6 +144,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     TOKEN = os.environ.get("BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
