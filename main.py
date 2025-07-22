@@ -12,11 +12,14 @@ import json
 from oauth2client.service_account import ServiceAccountCredentials
 
 # === НАСТРОЙКИ ===
+logging.basicConfig(level=logging.INFO)
+
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
+
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
@@ -24,7 +27,7 @@ drivers_data = {}
 assigned_requests = defaultdict(list)
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-# === СТАРТ ===
+# === /start ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="refresh")]])
@@ -34,13 +37,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Привет! Укажи параметры машины в формате:\n\n"
             "`2.5, 500, СПБ`\n\n"
             "где:\n"
-            "- 2.5 = объём в м³\xb3\n"
+            "- 2.5 = объём в м³\n"
             "- 500 = вес в кг\n"
             "- СПБ или СПБ + Область = зона доставки",
             parse_mode="Markdown"
         )
 
-# === ПАРСИНГ ПАРАМЕТРОВ ВОДИТЕЛЯ ===
+# === Ввод параметров водителя ===
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         volume_str, weight_str, zone = update.message.text.split(",")
@@ -56,7 +59,7 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, СПБ", parse_mode="Markdown")
 
-# === КНОПКИ ===
+# === Кнопки ===
 def build_task_keyboard(addr: str, row_index: int):
     yandex_url = f"https://yandex.ru/maps/?text={addr}"
     return InlineKeyboardMarkup([
@@ -67,7 +70,7 @@ def build_task_keyboard(addr: str, row_index: int):
         [InlineKeyboardButton("📍 Маршрут", url=yandex_url)]
     ])
 
-# === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
+# === Распределение заявок ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
     for user_id, driver in drivers_data.items():
@@ -75,22 +78,24 @@ async def distribute_tasks(bot):
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
+
         for idx, row in enumerate(rows, start=2):
-            if row.get("Водитель", "").strip() or row.get("Статус", "").strip().lower() == "выполняется":
+            if row.get("Водитель") or row.get("Статус") == "выполняется":
                 continue
+
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
                 zone = row.get("Вид перевозки", "").strip().lower()
 
-                if vol + total_vol <= driver["volume"] and \
-                   weight + total_weight <= driver["weight"] and \
-                   zone in driver["zone"]:
+                logging.info(f"[DEBUG] Проверка строки {idx}: заявка зона={zone} | водитель зона={driver['zone']}")
 
+                if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and zone in driver["zone"]:
                     total_vol += vol
                     total_weight += weight
-                    sheet.update(f"T{idx}", "выполняется")
-                    sheet.update(f"U{idx}", username)
+
+                    sheet.update(f"J{idx}", "выполняется")
+                    sheet.update(f"K{idx}", username)
                     assigned_requests[user_id].append(idx)
 
                     addr = row.get("Адрес доставки", "Москва")
@@ -98,18 +103,19 @@ async def distribute_tasks(bot):
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
                         f"🗓 Дата/время: {row.get('План время дата')}\n"
-                        f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
-                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
+                        f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа, руб.', '—')}₽\n"
                     )
                     await bot.send_message(
                         chat_id=user_id,
                         text=text,
                         reply_markup=build_task_keyboard(addr, idx)
                     )
-            except Exception:
+            except Exception as e:
+                logging.error(f"[ERROR] Ошибка при распределении строки {idx}: {e}")
                 continue
 
-# === ОТЧЁТ АДМИНУ ===
+# === Отчёт админу ===
 async def send_daily_report(bot):
     text = "🧾 Отчёт по задачам:\n"
     for user_id, tasks in assigned_requests.items():
@@ -117,7 +123,7 @@ async def send_daily_report(bot):
         text += f"\n{name}: {len(tasks)} задач"
     await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
 
-# === ОБРАБОТКА КНОПОК ===
+# === Обработка кнопок ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -128,15 +134,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await distribute_tasks(context.bot)
         await query.edit_message_text("🔄 Заявки перераспределены!")
         await send_daily_report(context.bot)
+
     elif query.data.startswith("done") or query.data.startswith("fail"):
         action, row_index = query.data.split(":")
         row_index = int(row_index)
         status = "выполнено" if action == "done" else "не выполнено"
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.update(f"T{row_index}", status)
-        sheet.update(f"V{row_index}", now)
 
-        addr = sheet.cell(row_index, 12).value or "адрес не указан"
+        sheet.update(f"J{row_index}", status)
+        sheet.update(f"L{row_index}", now)
+
+        addr = sheet.cell(row_index, 6).value or "адрес не указан"
         text = (
             f"📨 Ответ от @{username}:\n"
             f"Заявка по адресу: 📍 {addr}\n"
@@ -146,9 +154,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=ADMIN_ID, text=text)
         await query.edit_message_text(f"Статус заявки обновлён: {status}")
 
-# === ЗАПУСК ===
+# === Запуск бота ===
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     TOKEN = os.environ.get("BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
