@@ -34,7 +34,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Привет! Укажи параметры машины в формате:\n\n"
             "`2.5, 500, СПБ`\n\n"
             "где:\n"
-            "- 2.5 = объём в м³\n"
+            "- 2.5 = объём в м³\xb3\n"
             "- 500 = вес в кг\n"
             "- СПБ или СПБ + Область = зона доставки",
             parse_mode="Markdown"
@@ -70,50 +70,44 @@ def build_task_keyboard(addr: str, row_index: int):
 # === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
-
     for user_id, driver in drivers_data.items():
         total_vol = 0
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
-
         for idx, row in enumerate(rows, start=2):
-            # Пропускаем, если уже назначена или выполняется
-            if row.get("Водитель", "").strip() != "" or row.get("Статус", "").strip().lower() == "выполняется":
+            if row.get("Водитель", "").strip() or row.get("Статус", "").strip().lower() == "выполняется":
                 continue
-
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
-                zone = row.get("Вид перевозки", "").lower()
-                driver_zone = driver["zone"].lower()
+                zone = row.get("Вид перевозки", "").strip().lower()
 
-                # Сравнение зон и проверка по объёму/весу
-                if (
-                    vol + total_vol <= driver["volume"]
-                    and weight + total_weight <= driver["weight"]
-                    and (driver_zone in zone or zone in driver_zone)
-                ):
+                if vol + total_vol <= driver["volume"] and \
+                   weight + total_weight <= driver["weight"] and \
+                   zone in driver["zone"]:
+
                     total_vol += vol
                     total_weight += weight
-                    sheet.update(f"J{idx}", "выполняется")
-                    sheet.update(f"K{idx}", username)
+                    sheet.update(f"T{idx}", "выполняется")
+                    sheet.update(f"U{idx}", username)
                     assigned_requests[user_id].append(idx)
 
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
-                        f"🕒 Дата/время: {row.get('План время дата')}\n"
-                        f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
-                        f"💰 Сумма: {row.get('Стоимость заказа')}₽\n"
+                        f"🗓 Дата/время: {row.get('План время дата')}\n"
+                        f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
                     )
-                    await bot.send_message(user_id, text)
-
-            except Exception as e:
-                print(f"❌ Ошибка при обработке строки {idx}: {e}")
-
-    await bot.send_message(admin_id, "✅ Заявки перераспределены!\n🧾 Отчёт по задачам:")
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        reply_markup=build_task_keyboard(addr, idx)
+                    )
+            except Exception:
+                continue
 
 # === ОТЧЁТ АДМИНУ ===
 async def send_daily_report(bot):
