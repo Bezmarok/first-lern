@@ -85,8 +85,8 @@ async def distribute_tasks(bot):
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
-                    sheet.update(f"T{idx}", [["выполняется"]])
-                    sheet.update(f"U{idx}", [[username]])
+                    sheet.update(f"J{idx}", [["выполняется"]])
+                    sheet.update(f"K{idx}", [[username]])
                     assigned_requests[user_id].append(idx)
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
@@ -129,8 +129,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_index = int(row_index)
         status = "выполнено" if action == "done" else "не выполнено"
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.update(f"T{row_index}", [[status]])
-        sheet.update(f"V{row_index}", [[now]])
+        sheet.update(f"J{row_index}", [[status]])
+        sheet.update(f"K{row_index}", [[now]])
 
         addr = sheet.cell(row_index, 6).value or "адрес не указан"
         text = (
