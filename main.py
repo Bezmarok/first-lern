@@ -32,11 +32,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "Привет! Укажи параметры машины в формате:\n\n"
-            "`2.5, 500, СПБ`\n\n"
+            "`2.5, 500, Зона 1`\n\n"
             "где:\n"
             "- 2.5 = объём в м³\n"
             "- 500 = вес в кг\n"
-            "- СПБ или СПБ + Область = зона доставки",
+            "- Зона 1 / Зона 2 / Зона 3 = зона доставки",
             parse_mode="Markdown"
         )
 
@@ -54,7 +54,7 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
         }
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
     except Exception:
-        await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, СПБ", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, Зона 1", parse_mode="Markdown")
 
 # === КНОПКИ ===
 def build_task_keyboard(addr: str, row_index: int):
@@ -74,33 +74,39 @@ async def distribute_tasks(bot):
         total_vol = 0
         total_weight = 0
         username = driver["username"]
+        driver_zone = driver["zone"]
         assigned_requests[user_id] = []
+
         for idx, row in enumerate(rows, start=2):
-            if row.get("Водитель") or row.get("Статус") == "выполняется":
-                continue
             try:
+                if row.get("Водитель") or row.get("Статус") == "выполняется":
+                    continue
+
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
-                zone = row.get("Вид перевозки", "").lower()
-                if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
+                zone = row.get("Вид перевозки", "").strip().lower()
+
+                if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver_zone in zone:
                     total_vol += vol
                     total_weight += weight
                     sheet.update(f"J{idx}", [["выполняется"]])
                     sheet.update(f"K{idx}", [[username]])
                     assigned_requests[user_id].append(idx)
+
                     addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
                         f"🗓 Дата/время: {row.get('План время дата')}\n"
                         f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
-                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа, руб.', '—')}\n"
                     )
                     await bot.send_message(
                         chat_id=user_id,
                         text=text,
                         reply_markup=build_task_keyboard(addr, idx)
                     )
+
             except Exception as e:
                 logging.error(f"Ошибка при распределении строки {idx}: {e}")
                 continue
@@ -129,8 +135,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_index = int(row_index)
         status = "выполнено" if action == "done" else "не выполнено"
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.update(f"J{row_index}", [[status]])
-        sheet.update(f"K{row_index}", [[now]])
+
+        try:
+            sheet.update(f"J{row_index}", [[status]])
+            sheet.update(f"L{row_index}", [[now]])
+        except Exception as e:
+            logging.error(f"Ошибка при обновлении статуса: {e}")
 
         addr = sheet.cell(row_index, 6).value or "адрес не указан"
         text = (
@@ -144,7 +154,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     TOKEN = os.environ.get("BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
