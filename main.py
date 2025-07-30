@@ -20,17 +20,12 @@ client = gspread.authorize(creds)
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
+# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 drivers_data = {}
 assigned_requests = defaultdict(list)
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-zone_map = {
-    "1": "спб",
-    "2": "спб область",
-    "3": "москва"
-}
-
-# === СТАРТ ===
+# === START ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="refresh")]])
@@ -42,26 +37,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "где:\n"
             "- 2.5 = объём в м³\n"
             "- 500 = вес в кг\n"
-            "- 1 = СПБ\n"
-            "- 2 = СПБ Область\n"
-            "- 3 = Москва",
+            "- 1 (или 2, 3) = зона доставки",
             parse_mode="Markdown"
         )
 
-# === РЕГИСТРАЦИЯ ВОДИТЕЛЯ ===
+# === ОБРАБОТКА СООБЩЕНИЙ ОТ ВОДИТЕЛЯ ===
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        volume_str, weight_str, zone_number = update.message.text.split(",")
-        zone_number = zone_number.strip()
-        if zone_number not in zone_map:
-            raise ValueError("Неверная зона")
-
+        volume_str, weight_str, zone_digit = update.message.text.split(",")
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
+        zone_map = {"1": "зона 1", "2": "зона 2", "3": "зона 3"}
+        zone = zone_map.get(zone_digit.strip())
+        if not zone:
+            raise ValueError("Неверный номер зоны")
+
         drivers_data[user_id] = {
             "volume": float(volume_str.strip()),
             "weight": float(weight_str.strip()),
-            "zone": zone_map[zone_number],
+            "zone": zone,
             "username": username
         }
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
@@ -79,7 +73,7 @@ def build_task_keyboard(addr: str, row_index: int):
         [InlineKeyboardButton("📍 Маршрут", url=yandex_url)]
     ])
 
-# === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
+# === РАСПРЕДЕЛЕНИЕ ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
     for user_id, driver in drivers_data.items():
@@ -87,30 +81,30 @@ async def distribute_tasks(bot):
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
-
         for idx, row in enumerate(rows, start=2):
             if row.get("Водитель") or row.get("Статус") == "выполняется":
                 continue
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
-                zone = row.get("Вид перевозки", "").lower()
-
+                zone = row.get("Вид перевозки", "").strip().lower()
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
+                    addr = row.get("Адрес доставки", "Москва")
                     now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
                     sheet.update(f"J{idx}", "выполняется")
                     sheet.update(f"K{idx}", username)
                     sheet.update(f"L{idx}", now)
-                    assigned_requests[user_id].append(idx)
 
-                    addr = row.get("Адрес доставки", "Москва")
+                    assigned_requests[user_id].append(idx)
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
                         f"🗓 Дата/время: {row.get('План время дата')}\n"
-                        f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
+                        f"📦 Товары: {row.get('наименование')} x {row.get('Количество товара')}\n"
+                        f"💰 Сумма: {row.get('Стоимость заказа, руб.')}\n"
                     )
                     await bot.send_message(
                         chat_id=user_id,
@@ -118,8 +112,7 @@ async def distribute_tasks(bot):
                         reply_markup=build_task_keyboard(addr, idx)
                     )
             except Exception as e:
-                logging.error(f"Ошибка в распределении строки {idx}: {e}")
-                continue
+                logging.error(f"Ошибка при распределении строки {idx}: {e}")
 
 # === ОТЧЁТ АДМИНУ ===
 async def send_daily_report(bot):
