@@ -20,12 +20,11 @@ client = gspread.authorize(creds)
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
-# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 drivers_data = {}
 assigned_requests = defaultdict(list)
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-# === START ===
+# === СТАРТ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="refresh")]])
@@ -37,25 +36,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "где:\n"
             "- 2.5 = объём в м³\n"
             "- 500 = вес в кг\n"
-            "- 1 (или 2, 3) = зона доставки",
+            "- 1 / 2 / 3 = зона доставки",
             parse_mode="Markdown"
         )
 
-# === ОБРАБОТКА СООБЩЕНИЙ ОТ ВОДИТЕЛЯ ===
+# === РЕГИСТРАЦИЯ ВОДИТЕЛЯ ===
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        volume_str, weight_str, zone_digit = update.message.text.split(",")
+        volume_str, weight_str, zone = update.message.text.split(",")
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
-        zone_map = {"1": "зона 1", "2": "зона 2", "3": "зона 3"}
-        zone = zone_map.get(zone_digit.strip())
-        if not zone:
-            raise ValueError("Неверный номер зоны")
-
         drivers_data[user_id] = {
             "volume": float(volume_str.strip()),
             "weight": float(weight_str.strip()),
-            "zone": zone,
+            "zone": f"зона-{str(zone).strip()}",  # Преобразуем цифру в строку
             "username": username
         }
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
@@ -81,24 +75,26 @@ async def distribute_tasks(bot):
         total_weight = 0
         username = driver["username"]
         assigned_requests[user_id] = []
-        for idx, row in enumerate(rows, start=2):
+
+        for idx, row in enumerate(rows, start=2):  # start=2 т.к. первая строка — заголовки
             if row.get("Водитель") or row.get("Статус") == "выполняется":
                 continue
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
-                zone = row.get("Вид перевозки", "").strip().lower()
+                zone = str(row.get("Вид перевозки", "")).strip().lower()
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"] and driver["zone"] in zone:
                     total_vol += vol
                     total_weight += weight
-                    addr = row.get("Адрес доставки", "Москва")
                     now = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-                    sheet.update(f"J{idx}", "выполняется")
-                    sheet.update(f"K{idx}", username)
-                    sheet.update(f"L{idx}", now)
-
+                    # Запись в таблицу
+                    sheet.update(f"J{idx}", [["выполняется"]])
+                    sheet.update(f"K{idx}", [[username]])
+                    sheet.update(f"L{idx}", [[now]])
                     assigned_requests[user_id].append(idx)
+
+                    addr = row.get("Адрес доставки", "Москва")
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
@@ -113,8 +109,9 @@ async def distribute_tasks(bot):
                     )
             except Exception as e:
                 logging.error(f"Ошибка при распределении строки {idx}: {e}")
+                continue
 
-# === ОТЧЁТ АДМИНУ ===
+# === ОТЧЁТ ===
 async def send_daily_report(bot):
     text = "🧾 Отчёт по задачам:\n"
     for user_id, tasks in assigned_requests.items():
@@ -138,8 +135,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_index = int(row_index)
         status = "выполнено" if action == "done" else "не выполнено"
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.update(f"J{row_index}", status)
-        sheet.update(f"L{row_index}", now)
+
+        sheet.update(f"J{row_index}", [[status]])
+        sheet.update(f"L{row_index}", [[now]])
 
         addr = sheet.cell(row_index, 6).value or "адрес не указан"
         text = (
