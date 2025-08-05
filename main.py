@@ -1,5 +1,6 @@
 import logging
 import gspread
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters,
@@ -20,51 +21,56 @@ client = gspread.authorize(creds)
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
+ORS_API_KEY = os.environ.get("ORS_API_KEY")
+
 drivers_data = {}
 assigned_requests = defaultdict(list)
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
-
-# === СТАРТ ===
+# === РЕГИСТРАЦИЯ ВОДИТЕЛЯ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Распределить заявки", callback_data="refresh")]])
         await update.message.reply_text("Привет, админ! Нажми кнопку для распределения заявок:", reply_markup=keyboard)
     else:
         await update.message.reply_text(
-            "Привет! Введите данные машины в формате:\n\n"
-            "`2.5, 500`\n\n"
+            "Привет! Укажи параметры машины в формате:\n\n"
+            "`2.5, 500, 1`\n\n"
             "где:\n"
             "- 2.5 = объём в м³\n"
-            "- 500 = вес в кг",
+            "- 500 = вес в кг\n"
+            "- 1 = номер зоны доставки (1, 2 или 3)",
             parse_mode="Markdown"
         )
 
-# === РЕГИСТРАЦИЯ ВОДИТЕЛЯ ===
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        volume_str, weight_str = update.message.text.split(",")
+        volume_str, weight_str, zone_str = update.message.text.split(",")
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
         drivers_data[user_id] = {
             "volume": float(volume_str.strip()),
             "weight": float(weight_str.strip()),
+            "zone": zone_str.strip(),
             "username": username
         }
-        await update.message.reply_text("✅ Данные сохранены. Ожидайте назначения заявок.")
+        await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
     except Exception:
-        await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Неверный формат. Пример: 2.5, 500, 1", parse_mode="Markdown")
 
 # === КНОПКИ ===
-def build_task_keyboard(addr: str, row_index: int):
-    yandex_url = f"https://yandex.ru/maps/?text={addr}"
+def build_task_keyboard(addr: str, route_url: str, row_index: int):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{row_index}"),
             InlineKeyboardButton("❌ Не выполнено", callback_data=f"fail:{row_index}")
         ],
-        [InlineKeyboardButton("📍 Маршрут", url=yandex_url)]
+        [InlineKeyboardButton("📍 Маршрут", url=route_url)]
     ])
 
+# === МАРШРУТ через ORS ===
+async def get_route_url(address: str):
+    base_url = "https://www.openstreetmap.org/search?query="
+    return f"{base_url}{address.replace(' ', '%20')}"
 # === РАСПРЕДЕЛЕНИЕ ЗАЯВОК ===
 async def distribute_tasks(bot):
     rows = sheet.get_all_records()
@@ -80,7 +86,9 @@ async def distribute_tasks(bot):
             try:
                 vol = float(row.get("Объем заказа", 0))
                 weight = float(row.get("Вес заказа", 0))
-
+                zone = row.get("Вид перевозки", "").strip()
+                if zone != driver["zone"]:
+                    continue
                 if vol + total_vol <= driver["volume"] and weight + total_weight <= driver["weight"]:
                     total_vol += vol
                     total_weight += weight
@@ -89,24 +97,23 @@ async def distribute_tasks(bot):
                     sheet.update(f"K{idx}", username)
                     now = datetime.now().strftime("%d.%m.%Y %H:%M")
                     sheet.update(f"L{idx}", now)
-
                     assigned_requests[user_id].append(idx)
 
                     addr = row.get("Адрес доставки", "Москва")
+                    route_url = await get_route_url(addr)
                     text = (
                         f"📦 Заявка:\n"
                         f"📍 Адрес: {addr}\n"
-                        f"🗓 Плановая дата: {row.get('План время дата')}\n"
-                        f"📦 {row.get('Наименование')} x {row.get('Количество товара')}\n"
-                        f"📞 Телефон: {row.get('Телефон')}"
+                        f"🗓 План дата/время: {row.get('План время дата')}\n"
+                        f"📦 Товары: {row.get('Наименование')} x {row.get('Количество товара')}\n"
                     )
                     await bot.send_message(
                         chat_id=user_id,
                         text=text,
-                        reply_markup=build_task_keyboard(addr, idx)
+                        reply_markup=build_task_keyboard(addr, route_url, idx)
                     )
-            except Exception:
-                continue
+            except Exception as e:
+                logging.error(f"Ошибка при распределении заявки: {e}")
 
 # === ОТЧЁТ АДМИНУ ===
 async def send_daily_report(bot):
@@ -115,7 +122,6 @@ async def send_daily_report(bot):
         name = f"[{user_id}](tg://user?id={user_id})"
         text += f"\n{name}: {len(tasks)} задач"
     await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
-
 # === ОБРАБОТКА КНОПОК ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -125,7 +131,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "refresh":
         await distribute_tasks(context.bot)
-        await query.edit_message_text("🔄 Заявки распределены!")
+        await query.edit_message_text("🔄 Заявки перераспределены!")
         await send_daily_report(context.bot)
     elif query.data.startswith("done") or query.data.startswith("fail"):
         action, row_index = query.data.split(":")
@@ -140,10 +146,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📨 Ответ от @{username}:\n"
             f"Заявка по адресу: 📍 {addr}\n"
             f"Статус: {status}\n"
-            f"📍 https://yandex.ru/maps/?text={addr}"
+            f"Маршрут: https://www.openstreetmap.org/search?query={addr.replace(' ', '%20')}"
         )
         await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-        await query.edit_message_text(f"Статус заявки: {status}")
+        await query.edit_message_text(f"Статус заявки обновлён: {status}")
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
