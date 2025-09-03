@@ -11,6 +11,7 @@ import os
 import json
 import requests
 from oauth2client.service_account import ServiceAccountCredentials
+from math import radians, sin, cos, asin, sqrt
 
 # === ЛОГИ ===
 logging.basicConfig(level=logging.DEBUG)
@@ -26,7 +27,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 SHEET_NAME = "Cargodeliver"
-sheet = client.open(SHEET_NAME).sheet1
+sheet = client.open(SHEET_NAME).sheet1  # sheet1 как и просил
 
 # === ОКРУЖЕНИЕ ===
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
@@ -35,9 +36,9 @@ if not ORS_API_KEY:
 
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-# 🚚 Координаты склада
-WAREHOUSE_LAT = "59.780685"
-WAREHOUSE_LON = "30.170815"
+# 🚚 Координаты склада (как просил — через ENV, но по умолчанию выставляем фикс)
+WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
+WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
 TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
@@ -114,21 +115,57 @@ def to_float(val, default=0.0):
     except Exception:
         return default
 
+def _haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    return 2 * R * asin(sqrt(a))
+
+# === МАРШРУТНЫЕ ССЫЛКИ ===
+def build_point_route_url(lat: float, lon: float):
+    try:
+        lat = float(lat); lon = float(lon)
+    except Exception:
+        return "https://www.google.com/maps"
+    # если склад известен — ORS directions, иначе Google
+    if WAREHOUSE_LAT and WAREHOUSE_LON:
+        try:
+            slat = float(WAREHOUSE_LAT); slon = float(WAREHOUSE_LON)
+            return (
+                "https://maps.openrouteservice.org/directions"
+                f"?a={slon},{slat},{lon},{lat}&b=0&c=0&k1=ru-RU&k2=km&n1={lat}&n2={lon}&n3=14"
+            )
+        except Exception:
+            pass
+    return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
+
+def build_multistop_ors_url(latlon_list):
+    try:
+        pairs = []
+        for (lat, lon) in latlon_list:
+            pairs.append(f"{lon},{lat}")
+        a_param = ",".join(pairs)
+        center_lat = latlon_list[0][0]
+        center_lon = latlon_list[0][1]
+        return (
+            "https://maps.openrouteservice.org/directions"
+            f"?a={a_param}&b=0&c=0&k1=ru-RU&k2=km&n1={center_lat}&n2={center_lon}&n3=12"
+        )
+    except Exception:
+        return "https://maps.openrouteservice.org"
+
 # === ГЕОКОДИНГ ===
 def geocode_address(address):
-    """
-    Геокодим адрес в RU и подсказываем геокодеру фокус (склад),
-    чтобы не улетать в США/Европу.
-    """
+    """Геокодим адрес только в РФ, с фокусом на склад, чтобы не улетать в США/Европу."""
     try:
         url = "https://api.openrouteservice.org/geocode/search"
         params = {
             "api_key": ORS_API_KEY,
             "text": address,
-            "boundary.country": "RU",  # ⟵ ограничиваем страной
+            "boundary.country": "RU",
             "size": 1
         }
-        # Если склад задан — добавим фокус
         try:
             if WAREHOUSE_LAT and WAREHOUSE_LON:
                 params["focus.point.lat"] = float(WAREHOUSE_LAT)
@@ -144,11 +181,19 @@ def geocode_address(address):
             return None, None
 
         lon, lat = features[0]["geometry"]["coordinates"]  # [lon, lat]
+        # Отсечём «улетевшие» координаты
+        try:
+            dist_km = _haversine_km(float(WAREHOUSE_LAT), float(WAREHOUSE_LON), float(lat), float(lon))
+            if dist_km > 500:
+                logger.warning(f"Адрес слишком далеко ({dist_km:.0f} км): {address} -> {lat},{lon}")
+                return None, None
+        except Exception:
+            pass
+
         return lon, lat
     except Exception as e:
         logger.error(f"Ошибка геокодинга: {e}")
         return None, None
-
 
 # === ОБРАБОТКА ЗАЯВОК ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
@@ -166,7 +211,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             continue
 
         lon, lat = geocode_address(addr)
-        if not (lon and lat) or lon == 0 or lat == 0:
+        if not (lon and lat):
             logger.warning(f"Пропущена заявка {idx} — нет координат: {addr}")
             continue
 
@@ -179,13 +224,13 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
         vol = to_float(row.get("Объем заказа", 0))
         wgt = to_float(row.get("Вес заказа", 0))
-        order_no = row.get("Номер заявки") or row.get("ID") or idx
+        order_no = (row.get("Номер заявки") if COL_ORDER_NUM else None) or (row.get("ID") or idx)
 
-        job_id = idx
+        job_id = idx  # связываем с индексом строки
         job = {
             "id": job_id,
-            "location": [lon, lat],
-            "service": int(service_min * 60),
+            "location": [lon, lat],           # [lon, lat]
+            "service": int(service_min * 60), # сек
             "amount": [vol, wgt],
             "description": str(order_no)
         }
@@ -209,10 +254,10 @@ def build_vehicles_from_drivers():
     s_lat = float(WAREHOUSE_LAT)
     s_lon = float(WAREHOUSE_LON)
 
-    # Большое окно: от сегодня 00:00 до +3 суток 23:59
+    # Широкое окно: сегодня 00:00 → +3 суток 23:59
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
-    end   = today + timedelta(days=3, hours=23, minutes=59)
+    end = today + timedelta(days=3, hours=23, minutes=59)
 
     for user_id, drv in drivers_data.items():
         vol_cap = float(drv["volume"])
@@ -222,12 +267,12 @@ def build_vehicles_from_drivers():
             "profile": "driving-car",
             "start": [s_lon, s_lat],
             "end":   [s_lon, s_lat],
-            "time_window": [to_unix(start), to_unix(end)],   # ⟵ ШИРОКОЕ ОКНО
+            "time_window": [to_unix(start), to_unix(end)],
             "capacity": [vol_cap, wgt_cap],
             "description": drv["username"]
         })
     return vehicles
-    
+
 # === ЗАПРОС В ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
@@ -235,37 +280,26 @@ def ors_optimize(jobs, vehicles):
         "Authorization": ORS_API_KEY,
         "Content-Type": "application/json"
     }
-
     payload = {
         "jobs": jobs,
         "vehicles": vehicles,
-        "options": {"g": True}  # запрос геометрии маршрутов
+        "options": {"g": True}
     }
 
-    # 📦 Логируем информацию для Railway
     logger.info("🚀 Отправка запроса в ORS: %d заявок, %d водителей", len(jobs), len(vehicles))
-
-    if jobs:
-        logger.debug("📦 Пример job:\n%s", json.dumps(jobs[0], indent=2, ensure_ascii=False))
-    if vehicles:
-        logger.debug("🚐 Пример vehicle:\n%s", json.dumps(vehicles[0], indent=2, ensure_ascii=False))
-    
+    if jobs:     logger.debug("📦 Пример job:\n%s", json.dumps(jobs[0], indent=2, ensure_ascii=False))
+    if vehicles: logger.debug("🚐 Пример vehicle:\n%s", json.dumps(vehicles[0], indent=2, ensure_ascii=False))
     logger.debug("📤 Полный payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
     try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
-        response.raise_for_status()
-        logger.info("✅ ORS ответ успешно получен")
-        return response.json()
-    except requests.exceptions.HTTPError as http_err:
-        logger.error(f"❌ HTTP ошибка от ORS: {http_err.response.status_code} - {http_err.response.text}")
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"❌ HTTP ошибка ORS: {r.status_code} - {r.text}")
         raise
-    except Exception as err:
-        logger.exception("❌ Общая ошибка при обращении к ORS")
-        raise
+    return r.json()
 
-
-# === ОБРАБОТКА ВОДИТЕЛЕЙ ===
+# === TELEGRAM UI ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         keyboard = InlineKeyboardMarkup([
@@ -274,7 +308,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Привет, админ! Нажми кнопку:", reply_markup=keyboard)
     else:
         await update.message.reply_text(
-            "Укажи параметры машины, например:\n`2.5, 500`",
+            "Укажи параметры машины, например:\n`2.5, 500`\n(объём м³, вес кг)",
             parse_mode="Markdown"
         )
 
@@ -288,21 +322,23 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
             "weight": float(weight_str.strip().replace(",", ".")),
             "username": username
         }
-        await update.message.reply_text("✅ Данные сохранены.")
+        await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
     except Exception as e:
         logger.error(f"Ошибка регистрации водителя: {e}")
         await update.message.reply_text("⚠️ Неверный формат. Пример: `2.5, 500`", parse_mode="Markdown")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+def build_task_keyboard(lat: float, lon: float, row_index: int):
+    route_url = build_point_route_url(lat, lon)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{row_index}"),
+            InlineKeyboardButton("❌ Не выполнено", callback_data=f"fail:{row_index}")
+        ],
+        [InlineKeyboardButton("📍 Маршрут", url=route_url)]
+    ])
 
-    if query.data == "optimize":
-        await optimize_and_assign(context.bot)
-        await query.edit_message_text("🔄 Готово!")
-
-# === ОПТИМИЗАЦИЯ ===
-    async def optimize_and_assign(bot):
+# === ОСНОВНАЯ ОПТИМИЗАЦИЯ И РАССЫЛКА ===
+async def optimize_and_assign(bot):
     rows = sheet.get_all_records()
     if not drivers_data:
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет данных от водителей.")
@@ -318,10 +354,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей.")
         return
 
-    # Ограничение бесплатного ORS
+    # Ограничения бесплатного ORS
     if len(jobs) > 50 or len(vehicles) > 3:
-        await bot.send_message(chat_id=ADMIN_ID,
-                               text=f"⚠️ Превышен лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3).")
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ Превышен лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3)."
+        )
         return
 
     try:
@@ -333,8 +371,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     routes = solution.get("routes", [])
     unassigned = solution.get("unassigned", [])
-    await bot.send_message(chat_id=ADMIN_ID,
-                           text=f"🧠 ORS ответ: маршрутов {len(routes)}, нераспределены: {len(unassigned)}")
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"🧠 ORS ответ: маршрутов {len(routes)}, нераспределены: {len(unassigned)}"
+    )
 
     if not routes:
         await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет (все заявки могли попасть в unassigned).")
@@ -347,11 +387,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         drv = drivers_data.get(vid)
         driver_username = drv["username"] if drv else f"id_{vid}"
 
-        # только job-ступени
         job_steps = [s for s in steps if s.get("type") == "job"]
         logger.info("📦 vehicle.id=%s, driver=%s, job_steps=%d", vid, driver_username, len(job_steps))
-        await bot.send_message(chat_id=ADMIN_ID,
-                               text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
 
         waypoints_latlon = []
         lines = []
@@ -400,83 +438,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             per_stop_msgs.append((point_text, lat, lon, row_idx))
 
-        # если задач 0 — предупредим водителя
+        # отправка
         if len(job_steps) == 0:
+            # водителю всё равно пишем "пусто"
             try:
                 await bot.send_message(chat_id=vid, text="🧭 На сегодня заявок не назначено.")
                 await bot.send_message(chat_id=ADMIN_ID, text=f"ℹ️ {driver_username} (id={vid}) — 0 задач.")
             except Exception as e:
                 logger.error(f"Не удалось написать водителю {vid}: {e}")
                 await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли написать {driver_username} (id={vid}). Ошибка: {e}")
-            continue
+        else:
+            # сводка + маршрут
+            route_text = (
+                "🧭 Оптимальный маршрут на сегодня:\n" +
+                "\n".join(lines) +
+                f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
+            )
+            route_link = build_multistop_ors_url(waypoints_latlon) if waypoints_latlon else "https://maps.openrouteservice.org"
+            route_text += f"\n📍 Открыть маршрут: {route_link}"
 
-        # сводка + маршрут
-        route_text = (
-            "🧭 Оптимальный маршрут на сегодня:\n" +
-            "\n".join(lines) +
-            f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
-        )
-        route_link = build_multistop_ors_url(waypoints_latlon) if waypoints_latlon else "https://maps.openrouteservice.org"
-        route_text += f"\n📍 Открыть маршрут: {route_link}"
-
-        try:
-            await bot.send_message(chat_id=vid, text=route_text)
-            await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Сводка отправлена {driver_username} (id={vid})")
-        except Exception as e:
-            logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не удалось написать {driver_username} (id={vid}). Ошибка: {e}\n\n{route_text}")
-
-        # карточки
-        for pt_text, lat, lon, row_idx in per_stop_msgs:
             try:
-                await bot.send_message(chat_id=vid, text=pt_text,
-                                       reply_markup=build_task_keyboard(lat, lon, row_idx))
+                await bot.send_message(chat_id=vid, text=route_text)
+                await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Сводка отправлена {driver_username} (id={vid})")
             except Exception as e:
-                logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
-                await bot.send_message(chat_id=ADMIN_ID,
-                    text=f"⚠️ Карточка {row_idx} не доставлена {driver_username} (id={vid}). Ошибка: {e}\n\n{pt_text}")
+                logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
+                await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не удалось написать {driver_username} (id={vid}). Ошибка: {e}\n\n{route_text}")
 
-    # Итог админу (как и было)
+            for pt_text, lat, lon, row_idx in per_stop_msgs:
+                try:
+                    await bot.send_message(chat_id=vid, text=pt_text,
+                                           reply_markup=build_task_keyboard(lat, lon, row_idx))
+                except Exception as e:
+                    logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
+                    await bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"⚠️ Карточка {row_idx} не доставлена {driver_username} (id={vid}). Ошибка: {e}\n\n{pt_text}"
+                    )
+
+    # Итог админу
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=f"✅ Оптимизация завершена. Маршруты: {len(routes)}. Не распределены: {len(unassigned)}."
     )
 
-
-    # == ОТПРАВКА ==
-    # 1) Если заявок 0 — всё равно пишем водителю, чтобы он понял, что на сегодня пусто
-    if len(job_steps) == 0:
-        try:
-            await bot.send_message(chat_id=vid, text="🧭 На сегодня заявок не назначено.")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"ℹ️ {driver_username} (id={vid}) — 0 задач.")
-        except Exception as e:
-            logger.error(f"Не удалось написать водителю {vid}: {e}")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли написать {driver_username} (id={vid}). Ошибка: {e}")
-        continue  # к следующему маршруту
-
-    # 2) Сводка + ссылка на маршрут
-    route_text = (
-        "🧭 Оптимальный маршрут на сегодня:\n"
-        + "\n".join(lines) +
-        f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
-    )
-    route_link = build_multistop_ors_url(waypoints_latlon) if waypoints_latlon else "https://maps.openrouteservice.org"
-    route_text += f"\n📍 Открыть маршрут: {route_link}"
-
-    try:
-        await bot.send_message(chat_id=vid, text=route_text)
-        await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Сводка отправлена {driver_username} (id={vid})")
-    except Exception as e:
-        logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не удалось написать {driver_username} (id={vid}). Ошибка: {e}\n\n{route_text}")
-
-    # 3) Карточки по точкам
-    for pt_text, lat, lon, row_idx in per_stop_msgs:
-        try:
-            await bot.send_message(chat_id=vid, text=pt_text, reply_markup=build_task_keyboard(lat, lon, row_idx))
-        except Exception as e:
-            logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Карточка {row_idx} не доставлена {driver_username} (id={vid}). Ошибка: {e}\n\n{pt_text}")
+# === КНОПКИ ===
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "optimize":
+        await optimize_and_assign(context.bot)
+        await query.edit_message_text("🔄 Маршруты построены и разосланы!")
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
@@ -489,9 +500,3 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
-
-
-
-
-
-
