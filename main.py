@@ -302,70 +302,146 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔄 Готово!")
 
 # === ОПТИМИЗАЦИЯ ===
-for r in routes:
-    vid = int(r["vehicle"])  # на всякий случай приводим к int
-    steps = r.get("steps", [])
-    drv = drivers_data.get(vid)
-    driver_username = drv["username"] if drv else f"id_{vid}"
+async def optimize_and_assign(bot):
+    rows = sheet.get_all_records()
+    if not drivers_data:
+        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет данных от водителей.")
+        return
 
-    # Посчитаем, сколько реально job-ступеней в этом маршруте
-    job_steps = [s for s in steps if s.get("type") == "job"]
-    logger.info("📦 vehicle.id=%s, driver=%s, job_steps=%d", vid, driver_username, len(job_steps))
+    jobs, row_index_by_job_id, coords_cache, job_info = build_jobs_from_sheet(rows)
+    if not jobs:
+        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации.")
+        return
+
+    vehicles = build_vehicles_from_drivers()
+    if not vehicles:
+        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей.")
+        return
+
+    # Ограничение бесплатного ORS
+    if len(jobs) > 50 or len(vehicles) > 3:
+        await bot.send_message(chat_id=ADMIN_ID,
+                               text=f"⚠️ Превышен лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3).")
+        return
+
+    try:
+        solution = ors_optimize(jobs, vehicles)
+    except Exception as e:
+        logger.exception("Ошибка ORS Optimization")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка оптимизации: {e}")
+        return
+
+    routes = solution.get("routes", [])
+    unassigned = solution.get("unassigned", [])
     await bot.send_message(chat_id=ADMIN_ID,
-                           text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
+                           text=f"🧠 ORS ответ: маршрутов {len(routes)}, нераспределены: {len(unassigned)}")
 
-    # Список точек для ORS-ссылки + карточки
-    waypoints_latlon = []
-    lines = []
-    total_vol = 0.0
-    total_wgt = 0.0
-    per_stop_msgs = []  # (text, lat, lon, row_idx)
+    if not routes:
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет (все заявки могли попасть в unassigned).")
+        return
 
-    for s in job_steps:
-        job_id = s["job"]
-        row_idx = row_index_by_job_id[job_id]
-        info = job_info[job_id]
-        addr = info["addr"]; order_no = info["order_no"]; vol = info["vol"]; wgt = info["wgt"]
-        total_vol += vol; total_wgt += wgt
+    # === РАССЫЛКА ВОДИТЕЛЯМ ===
+    for r in routes:
+        vid = int(r["vehicle"])  # на всякий случай
+        steps = r.get("steps", [])
+        drv = drivers_data.get(vid)
+        driver_username = drv["username"] if drv else f"id_{vid}"
 
-        arrival = s.get("arrival")
-        eta_str = datetime.fromtimestamp(arrival).strftime("%H:%M") if arrival else ""
+        # только job-ступени
+        job_steps = [s for s in steps if s.get("type") == "job"]
+        logger.info("📦 vehicle.id=%s, driver=%s, job_steps=%d", vid, driver_username, len(job_steps))
+        await bot.send_message(chat_id=ADMIN_ID,
+                               text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
 
-        # координаты для ссылки
-        lon, lat = coords_cache.get(row_idx, (None, None))
-        if lon and lat:
-            waypoints_latlon.append((lat, lon))
+        waypoints_latlon = []
+        lines = []
+        total_vol = 0.0
+        total_wgt = 0.0
+        per_stop_msgs = []  # (text, lat, lon, row_idx)
 
-        # повторная проверка, но не блокируем рассылку даже если уже занято
-        live_status = (sheet.cell(row_idx, COL_STATUS).value or "").strip().lower() if COL_STATUS else ""
-        live_driver = (sheet.cell(row_idx, COL_DRIVER).value or "").strip() if COL_DRIVER else ""
+        for s in job_steps:
+            job_id = s["job"]
+            row_idx = row_index_by_job_id[job_id]
+            info = job_info[job_id]
+            addr = info["addr"]; order_no = info["order_no"]; vol = info["vol"]; wgt = info["wgt"]
+            total_vol += vol; total_wgt += wgt
 
-        # обновления в таблице делаем только если ещё не занято
-        if not (live_status in ("выполняется", "выполнено") or live_driver):
-            when = now_human()
-            if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
-            if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
-            if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, when)
-            if COL_ETA and arrival: sheet.update_cell(row_idx, COL_ETA, eta_str)
+            arrival = s.get("arrival")
+            eta_str = datetime.fromtimestamp(arrival).strftime("%H:%M") if arrival else ""
 
-        # сводная строка
-        lines.append(f"• №{order_no} — {addr} (ETA {eta_str})")
+            lon, lat = coords_cache.get(row_idx, (None, None))
+            if lon and lat:
+                waypoints_latlon.append((lat, lon))
 
-        # карточка точки
-        row = rows[row_idx - 2]
-        plan_dt   = row.get("План время дата", "")
-        item_name = row.get("Наименование", "")
-        item_qty  = row.get("Количество товара", "")
-        phone     = row.get("Телефон", "")
-        point_text = (
-            f"📦 Заявка №{order_no}\n"
-            f"📍 Адрес: {addr}\n"
-            f"🗓 Время: {plan_dt}\n"
-            f"⏱ ETA: {eta_str}\n"
-            f"📦 Товары: {item_name} x {item_qty}\n"
-            f"📞 Тел: {phone}"
+            # апдейты таблицы, если строка ещё не занята
+            live_status = (sheet.cell(row_idx, COL_STATUS).value or "").strip().lower() if COL_STATUS else ""
+            live_driver = (sheet.cell(row_idx, COL_DRIVER).value or "").strip() if COL_DRIVER else ""
+            if not (live_status in ("выполняется", "выполнено") or live_driver):
+                when = now_human()
+                if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
+                if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
+                if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, when)
+                if COL_ETA and arrival: sheet.update_cell(row_idx, COL_ETA, eta_str)
+
+            lines.append(f"• №{order_no} — {addr} (ETA {eta_str})")
+
+            row = rows[row_idx - 2]
+            plan_dt   = row.get("План время дата", "")
+            item_name = row.get("Наименование", "")
+            item_qty  = row.get("Количество товара", "")
+            phone     = row.get("Телефон", "")
+            point_text = (
+                f"📦 Заявка №{order_no}\n"
+                f"📍 Адрес: {addr}\n"
+                f"🗓 Время: {plan_dt}\n"
+                f"⏱ ETA: {eta_str}\n"
+                f"📦 Товары: {item_name} x {item_qty}\n"
+                f"📞 Тел: {phone}"
+            )
+            per_stop_msgs.append((point_text, lat, lon, row_idx))
+
+        # если задач 0 — предупредим водителя
+        if len(job_steps) == 0:
+            try:
+                await bot.send_message(chat_id=vid, text="🧭 На сегодня заявок не назначено.")
+                await bot.send_message(chat_id=ADMIN_ID, text=f"ℹ️ {driver_username} (id={vid}) — 0 задач.")
+            except Exception as e:
+                logger.error(f"Не удалось написать водителю {vid}: {e}")
+                await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли написать {driver_username} (id={vid}). Ошибка: {e}")
+            continue
+
+        # сводка + маршрут
+        route_text = (
+            "🧭 Оптимальный маршрут на сегодня:\n" +
+            "\n".join(lines) +
+            f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
         )
-        per_stop_msgs.append((point_text, lat, lon, row_idx))
+        route_link = build_multistop_ors_url(waypoints_latlon) if waypoints_latlon else "https://maps.openrouteservice.org"
+        route_text += f"\n📍 Открыть маршрут: {route_link}"
+
+        try:
+            await bot.send_message(chat_id=vid, text=route_text)
+            await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Сводка отправлена {driver_username} (id={vid})")
+        except Exception as e:
+            logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
+            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не удалось написать {driver_username} (id={vid}). Ошибка: {e}\n\n{route_text}")
+
+        # карточки
+        for pt_text, lat, lon, row_idx in per_stop_msgs:
+            try:
+                await bot.send_message(chat_id=vid, text=pt_text,
+                                       reply_markup=build_task_keyboard(lat, lon, row_idx))
+            except Exception as e:
+                logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
+                await bot.send_message(chat_id=ADMIN_ID,
+                    text=f"⚠️ Карточка {row_idx} не доставлена {driver_username} (id={vid}). Ошибка: {e}\n\n{pt_text}")
+
+    # Итог админу (как и было)
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"✅ Оптимизация завершена. Маршруты: {len(routes)}. Не распределены: {len(unassigned)}."
+    )
+
 
     # == ОТПРАВКА ==
     # 1) Если заявок 0 — всё равно пишем водителю, чтобы он понял, что на сегодня пусто
@@ -413,6 +489,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
 
