@@ -189,9 +189,10 @@ def build_vehicles_from_drivers():
     s_lat = float(WAREHOUSE_LAT)
     s_lon = float(WAREHOUSE_LON)
 
-    today = datetime.now()
-    start = today.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = today.replace(hour=21, minute=0, second=0, microsecond=0)
+    # Большое окно: от сегодня 00:00 до +3 суток 23:59
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today
+    end   = today + timedelta(days=3, hours=23, minutes=59)
 
     for user_id, drv in drivers_data.items():
         vol_cap = float(drv["volume"])
@@ -200,13 +201,13 @@ def build_vehicles_from_drivers():
             "id": int(user_id),
             "profile": "driving-car",
             "start": [s_lon, s_lat],
-            "end": [s_lon, s_lat],
-            "time_window": [to_unix(start), to_unix(end)],
+            "end":   [s_lon, s_lat],
+            "time_window": [to_unix(start), to_unix(end)],   # ⟵ ШИРОКОЕ ОКНО
             "capacity": [vol_cap, wgt_cap],
             "description": drv["username"]
         })
     return vehicles
-
+    
 # === ЗАПРОС В ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
@@ -316,4 +317,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
