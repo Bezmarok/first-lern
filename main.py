@@ -116,19 +116,39 @@ def to_float(val, default=0.0):
 
 # === ГЕОКОДИНГ ===
 def geocode_address(address):
+    """
+    Геокодим адрес в RU и подсказываем геокодеру фокус (склад),
+    чтобы не улетать в США/Европу.
+    """
     try:
         url = "https://api.openrouteservice.org/geocode/search"
-        params = {"api_key": ORS_API_KEY, "text": address}
+        params = {
+            "api_key": ORS_API_KEY,
+            "text": address,
+            "boundary.country": "RU",  # ⟵ ограничиваем страной
+            "size": 1
+        }
+        # Если склад задан — добавим фокус
+        try:
+            if WAREHOUSE_LAT and WAREHOUSE_LON:
+                params["focus.point.lat"] = float(WAREHOUSE_LAT)
+                params["focus.point.lon"] = float(WAREHOUSE_LON)
+        except Exception:
+            pass
+
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         features = response.json().get("features", [])
         if not features:
+            logger.warning(f"Геокодер не нашёл адрес: {address}")
             return None, None
-        lon, lat = features[0]["geometry"]["coordinates"]
+
+        lon, lat = features[0]["geometry"]["coordinates"]  # [lon, lat]
         return lon, lat
     except Exception as e:
         logger.error(f"Ошибка геокодинга: {e}")
         return None, None
+
 
 # === ОБРАБОТКА ЗАЯВОК ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
@@ -317,5 +337,6 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
