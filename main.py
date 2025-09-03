@@ -214,22 +214,35 @@ def ors_optimize(jobs, vehicles):
         "Authorization": ORS_API_KEY,
         "Content-Type": "application/json"
     }
+
     payload = {
         "jobs": jobs,
         "vehicles": vehicles,
-        "options": {"g": True}
+        "options": {"g": True}  # запрос геометрии маршрутов
     }
 
-    logger.info("🚀 Запрос в ORS: %d заявок, %d водителей", len(jobs), len(vehicles))
+    # 📦 Логируем информацию для Railway
+    logger.info("🚀 Отправка запроса в ORS: %d заявок, %d водителей", len(jobs), len(vehicles))
+
     if jobs:
         logger.debug("📦 Пример job:\n%s", json.dumps(jobs[0], indent=2, ensure_ascii=False))
     if vehicles:
         logger.debug("🚐 Пример vehicle:\n%s", json.dumps(vehicles[0], indent=2, ensure_ascii=False))
-    logger.debug("📤 Payload для ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+    
+    logger.debug("📤 Полный payload:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
-    r.raise_for_status()
-    return r.json()
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
+        response.raise_for_status()
+        logger.info("✅ ORS ответ успешно получен")
+        return response.json()
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"❌ HTTP ошибка от ORS: {http_err.response.status_code} - {http_err.response.text}")
+        raise
+    except Exception as err:
+        logger.exception("❌ Общая ошибка при обращении к ORS")
+        raise
+
 
 # === ОБРАБОТКА ВОДИТЕЛЕЙ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -303,3 +316,4 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
