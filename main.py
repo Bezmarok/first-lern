@@ -302,7 +302,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔄 Готово!")
 
 # === ОПТИМИЗАЦИЯ ===
-async def optimize_and_assign(bot):
+    async def optimize_and_assign(bot):
     rows = sheet.get_all_records()
     if not drivers_data:
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет данных от водителей.")
@@ -489,6 +489,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
 
