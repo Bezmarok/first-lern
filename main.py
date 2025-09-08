@@ -36,7 +36,6 @@ if not ORS_API_KEY:
 
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-# 🚚 Координаты склада
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
@@ -47,7 +46,7 @@ DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 drivers_data = {}  # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
 assigned_requests = defaultdict(list)
 
-# === ЗАГОЛОВКИ И КОЛОНКИ ===
+# === КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
 COL_INDEX = {name.strip(): i + 1 for i, name in enumerate(HEADERS)}
 
@@ -123,7 +122,7 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
-# === МАРШРУТНЫЕ ССЫЛКИ (Google Maps вместо ORS) ===
+# === МАРШРУТНЫЕ ССЫЛКИ (Google Maps) ===
 def build_google_maps_multistop(latlon_list):
     if not latlon_list:
         return "https://www.google.com/maps"
@@ -170,7 +169,7 @@ def geocode_address(address):
         logger.error(f"Ошибка геокодинга: {e}")
         return None, None
 
-# === ОБРАБОТКА ЗАЯВОК ===
+# === JOBS ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     jobs = []
     row_index_by_job_id = {}
@@ -200,15 +199,14 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         wgt = to_float(row.get("Вес заказа", 0))
 
         order_no = row.get("НОМЕР заявки") or row.get("Номер заявки") or row.get("ID") or idx
-        try:
-            job_id = int(order_no)
-        except:
-            job_id = idx  # fallback если вдруг что-то не число
+
+        job_id = idx  # всегда int для ORS
+
         job = {
             "id": job_id,
-            "location": [lon, lat],
+            "location": [float(lon), float(lat)],
             "service": int(service_min * 60),
-            "amount": [vol, wgt],
+            "amount": [float(vol), float(wgt)],
             "description": str(order_no)
         }
         if tw:
@@ -225,7 +223,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
-# === МАШИНЫ ===
+# === VEHICLES ===
 def build_vehicles_from_drivers():
     vehicles = []
     s_lat = float(WAREHOUSE_LAT)
@@ -239,17 +237,17 @@ def build_vehicles_from_drivers():
         vol_cap = float(drv["volume"])
         wgt_cap = float(drv["weight"])
         vehicles.append({
-            "ID": int(user_id),
+            "id": int(user_id),
             "profile": "driving-car",
-            "start": [s_lon, s_lat],
-            "end":   [s_lon, s_lat],
+            "start": [float(s_lon), float(s_lat)],
+            "end":   [float(s_lon), float(s_lat)],
             "time_window": [to_unix(start), to_unix(end)],
-            "capacity": [vol_cap, wgt_cap],
+            "capacity": [float(vol_cap), float(wgt_cap)],
             "description": drv["username"]
         })
     return vehicles
 
-# === ЗАПРОС В ORS ===
+# === ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
     headers = {
@@ -261,6 +259,9 @@ def ors_optimize(jobs, vehicles):
         "vehicles": vehicles,
         "options": {"g": True}
     }
+
+    logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
     r.raise_for_status()
     return r.json()
@@ -304,7 +305,7 @@ def build_task_keyboard(lat: float, lon: float, row_index: int):
         [InlineKeyboardButton("📍 Маршрут", url=route_url)]
     ])
 
-# === ОСНОВНАЯ ОПТИМИЗАЦИЯ И РАССЫЛКА ===
+# === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot):
     rows = sheet.get_all_records()
     if not drivers_data:
@@ -360,7 +361,7 @@ async def optimize_and_assign(bot):
         per_stop_msgs = []
 
         for s in job_steps:
-            job_id = str(s["job"])
+            job_id = int(s["job"])
             row_idx = row_index_by_job_id[job_id]
             info = job_info[job_id]
             addr = info["addr"]; order_no = info["order_no"]; vol = info["vol"]; wgt = info["wgt"]
