@@ -27,7 +27,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 SHEET_NAME = "Cargodeliver"
-sheet = client.open(SHEET_NAME).sheet1  # sheet1 как и просил
+sheet = client.open(SHEET_NAME).sheet1
 
 # === ОКРУЖЕНИЕ ===
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
@@ -125,7 +125,6 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 
 # === МАРШРУТНЫЕ ССЫЛКИ (Google Maps вместо ORS) ===
 def build_google_maps_multistop(latlon_list):
-    """Строим ссылку на маршрут через Google Maps, чтобы открывался везде"""
     if not latlon_list:
         return "https://www.google.com/maps"
     try:
@@ -140,7 +139,6 @@ def build_google_maps_multistop(latlon_list):
         return "https://www.google.com/maps"
 
 def build_point_route_url(lat: float, lon: float):
-    """Ссылка для одной точки"""
     try:
         return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
     except Exception:
@@ -156,29 +154,17 @@ def geocode_address(address):
             "boundary.country": "RU",
             "size": 1
         }
-        try:
-            if WAREHOUSE_LAT and WAREHOUSE_LON:
-                params["focus.point.lat"] = float(WAREHOUSE_LAT)
-                params["focus.point.lon"] = float(WAREHOUSE_LON)
-        except Exception:
-            pass
+        if WAREHOUSE_LAT and WAREHOUSE_LON:
+            params["focus.point.lat"] = float(WAREHOUSE_LAT)
+            params["focus.point.lon"] = float(WAREHOUSE_LON)
 
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         features = response.json().get("features", [])
         if not features:
-            logger.warning(f"Геокодер не нашёл адрес: {address}")
             return None, None
 
         lon, lat = features[0]["geometry"]["coordinates"]
-        try:
-            dist_km = _haversine_km(float(WAREHOUSE_LAT), float(WAREHOUSE_LON), float(lat), float(lon))
-            if dist_km > 500:
-                logger.warning(f"Адрес слишком далеко ({dist_km:.0f} км): {address} -> {lat},{lon}")
-                return None, None
-        except Exception:
-            pass
-
         return lon, lat
     except Exception as e:
         logger.error(f"Ошибка геокодинга: {e}")
@@ -201,7 +187,6 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
         lon, lat = geocode_address(addr)
         if not (lon and lat):
-            logger.warning(f"Пропущена заявка {idx} — нет координат: {addr}")
             continue
 
         coords_cache[idx] = (lon, lat)
@@ -274,8 +259,6 @@ def ors_optimize(jobs, vehicles):
         "vehicles": vehicles,
         "options": {"g": True}
     }
-
-    logger.info("🚀 Отправка запроса в ORS: %d заявок, %d водителей", len(jobs), len(vehicles))
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
     r.raise_for_status()
     return r.json()
@@ -346,7 +329,6 @@ async def optimize_and_assign(bot):
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
-        logger.exception("Ошибка ORS Optimization")
         await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка оптимизации: {e}")
         return
 
@@ -358,7 +340,7 @@ async def optimize_and_assign(bot):
     )
 
     if not routes:
-        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет (все заявки могли попасть в unassigned).")
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет.")
         return
 
     for r in routes:
@@ -368,7 +350,6 @@ async def optimize_and_assign(bot):
         driver_username = drv["username"] if drv else f"id_{vid}"
 
         job_steps = [s for s in steps if s.get("type") == "job"]
-        await bot.send_message(chat_id=ADMIN_ID, text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
 
         waypoints_latlon = []
         lines = []
@@ -390,15 +371,11 @@ async def optimize_and_assign(bot):
             if lon and lat:
                 waypoints_latlon.append((lat, lon))
 
-            live_status = (sheet.cell(row_idx, COL_STATUS).value or "").strip().lower() if COL_STATUS else ""
-            live_driver = (sheet.cell(row_idx, COL_DRIVER).value or "").strip() if COL_DRIVER else ""
-            if not (live_status in ("выполняется", "выполнено") or live_driver):
-                when = now_human()
-                if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
-                if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
-                if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, when)
-                if COL_ETA and arrival: sheet.update_cell(row_idx, COL_ETA, eta_str)
-                if COL_CAR_PLATE and drv: sheet.update_cell(row_idx, COL_CAR_PLATE, drv.get("car_plate", ""))
+            if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
+            if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
+            if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
+            if COL_ETA and arrival: sheet.update_cell(row_idx, COL_ETA, eta_str)
+            if COL_CAR_PLATE and drv: sheet.update_cell(row_idx, COL_CAR_PLATE, drv.get("car_plate", ""))
 
             lines.append(f"• №{order_no} — {addr} (ETA {eta_str})")
 
@@ -410,4 +387,41 @@ async def optimize_and_assign(bot):
             point_text = (
                 f"📦 Заявка №{order_no}\n"
                 f"📍 Адрес: {addr}\n"
-                f"
+                f"🗓 Время: {plan_dt}\n"
+                f"⏱ ETA: {eta_str}\n"
+                f"📦 Товары: {item_name} x {item_qty}\n"
+                f"📞 Тел: {phone}\n"
+                f"🚘 Госномер: {drv.get('car_plate', '') if drv else ''}"
+            )
+            per_stop_msgs.append((point_text, lat, lon, row_idx))
+
+        route_text = (
+            "🧭 Оптимальный маршрут на сегодня:\n" +
+            "\n".join(lines) +
+            f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
+        )
+        route_link = build_google_maps_multistop(waypoints_latlon)
+        route_text += f"\n📍 Открыть маршрут: {route_link}"
+
+        await bot.send_message(chat_id=vid, text=route_text)
+
+        for pt_text, lat, lon, row_idx in per_stop_msgs:
+            await bot.send_message(chat_id=vid, text=pt_text,
+                                   reply_markup=build_task_keyboard(lat, lon, row_idx))
+
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"✅ Оптимизация завершена. Маршруты: {len(routes)}. Не распределены: {len(unassigned)}."
+    )
+
+# === КНОПКИ ===
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "optimize":
+        await optimize_and_assign(context.bot)
+        await query.edit_message_text("🔄 Маршруты построены и разосланы!")
+
+# === ЗАПУСК ===
+if __name__ == "__main__":
+    TOKEN =
