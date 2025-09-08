@@ -199,9 +199,11 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         vol = to_float(row.get("Объем заказа", 0))
         wgt = to_float(row.get("Вес заказа", 0))
 
-        order_no = row.get("НОМЕР заявки") or row.get("Номер заявки") or row.get("ID") or str(idx)
-
-        job_id = str(order_no)
+        order_no = row.get("НОМЕР заявки") or row.get("Номер заявки") or row.get("ID") or idx
+        try:
+            job_id = int(order_no)
+        except:
+            job_id = idx  # fallback если вдруг что-то не число
         job = {
             "id": job_id,
             "location": [lon, lat],
@@ -237,7 +239,7 @@ def build_vehicles_from_drivers():
         vol_cap = float(drv["volume"])
         wgt_cap = float(drv["weight"])
         vehicles.append({
-            "id": int(user_id),
+            "ID": int(user_id),
             "profile": "driving-car",
             "start": [s_lon, s_lat],
             "end":   [s_lon, s_lat],
@@ -433,3 +435,4 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
