@@ -27,7 +27,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 SHEET_NAME = "Cargodeliver"
-sheet = client.open(SHEET_NAME).sheet1
+sheet = client.open(SHEET_NAME).sheet1  # sheet1 как и просил
 
 # === ОКРУЖЕНИЕ ===
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
@@ -36,6 +36,7 @@ if not ORS_API_KEY:
 
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
+# 🚚 Координаты склада
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
@@ -46,7 +47,7 @@ DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 drivers_data = {}  # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
 assigned_requests = defaultdict(list)
 
-# === КОЛОНКИ ===
+# === ЗАГОЛОВКИ И КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
 COL_INDEX = {name.strip(): i + 1 for i, name in enumerate(HEADERS)}
 
@@ -124,6 +125,7 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 
 # === МАРШРУТНЫЕ ССЫЛКИ (Google Maps) ===
 def build_google_maps_multistop(latlon_list):
+    """latlon_list = [(lat, lon), ...] уже в нужном порядке"""
     if not latlon_list:
         return "https://www.google.com/maps"
     try:
@@ -138,6 +140,7 @@ def build_google_maps_multistop(latlon_list):
         return "https://www.google.com/maps"
 
 def build_point_route_url(lat: float, lon: float):
+    """Маршрут до одной точки (из текущего местоположения водителя)"""
     try:
         return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
     except Exception:
@@ -145,6 +148,7 @@ def build_point_route_url(lat: float, lon: float):
 
 # === ГЕОКОДИНГ ===
 def geocode_address(address):
+    """Геокодим адрес в РФ c фокусом на склад."""
     try:
         url = "https://api.openrouteservice.org/geocode/search"
         params = {
@@ -161,6 +165,7 @@ def geocode_address(address):
         response.raise_for_status()
         features = response.json().get("features", [])
         if not features:
+            logger.warning(f"Геокодер не нашёл адрес: {address}")
             return None, None
 
         lon, lat = features[0]["geometry"]["coordinates"]
@@ -169,7 +174,7 @@ def geocode_address(address):
         logger.error(f"Ошибка геокодинга: {e}")
         return None, None
 
-# === JOBS ===
+# === ОБРАБОТКА ЗАЯВОК ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     jobs = []
     row_index_by_job_id = {}
@@ -186,9 +191,10 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
         lon, lat = geocode_address(addr)
         if not (lon and lat):
+            logger.warning(f"Пропущена заявка {idx} — нет координат: {addr}")
             continue
 
-        coords_cache[idx] = (lon, lat)
+        coords_cache[idx] = (float(lon), float(lat))
 
         service_min = DEFAULT_SERVICE_MIN
         if COL_SERVICE_MIN:
@@ -198,14 +204,16 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         vol = to_float(row.get("Объем заказа", 0))
         wgt = to_float(row.get("Вес заказа", 0))
 
+        # "человеческий" номер заявки из файла (что должен видеть водитель)
         order_no = row.get("НОМЕР заявки") or row.get("Номер заявки") or row.get("ID") or idx
 
-        job_id = idx  # всегда int для ORS
+        # "технический" id для ORS (всегда int)
+        job_id = idx
 
         job = {
             "id": job_id,
-            "location": [float(lon), float(lat)],
-            "service": int(service_min * 60),
+            "location": [float(lon), float(lat)],         # [lon, lat]
+            "service": int(service_min * 60),             # сек
             "amount": [float(vol), float(wgt)],
             "description": str(order_no)
         }
@@ -223,12 +231,13 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
-# === VEHICLES ===
+# === МАШИНЫ ===
 def build_vehicles_from_drivers():
     vehicles = []
     s_lat = float(WAREHOUSE_LAT)
     s_lon = float(WAREHOUSE_LON)
 
+    # Широкое окно: сегодня 00:00 → +3 суток
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
     end = today + timedelta(days=3, hours=23, minutes=59)
@@ -239,7 +248,7 @@ def build_vehicles_from_drivers():
         vehicles.append({
             "id": int(user_id),
             "profile": "driving-car",
-            "start": [float(s_lon), float(s_lat)],
+            "start": [float(s_lon), float(s_lat)],  # [lon, lat]
             "end":   [float(s_lon), float(s_lat)],
             "time_window": [to_unix(start), to_unix(end)],
             "capacity": [float(vol_cap), float(wgt_cap)],
@@ -247,7 +256,7 @@ def build_vehicles_from_drivers():
         })
     return vehicles
 
-# === ORS ===
+# === ЗАПРОС В ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
     headers = {
@@ -259,11 +268,14 @@ def ors_optimize(jobs, vehicles):
         "vehicles": vehicles,
         "options": {"g": True}
     }
-
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"❌ HTTP ошибка ORS: {r.status_code} - {r.text}")
+        raise
     return r.json()
 
 # === TELEGRAM UI ===
@@ -305,7 +317,7 @@ def build_task_keyboard(lat: float, lon: float, row_index: int):
         [InlineKeyboardButton("📍 Маршрут", url=route_url)]
     ])
 
-# === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
+# === ОСНОВНАЯ ОПТИМИЗАЦИЯ И РАССЫЛКА ===
 async def optimize_and_assign(bot):
     rows = sheet.get_all_records()
     if not drivers_data:
@@ -322,6 +334,7 @@ async def optimize_and_assign(bot):
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей.")
         return
 
+    # Ограничения бесплатного ORS
     if len(jobs) > 50 or len(vehicles) > 3:
         await bot.send_message(
             chat_id=ADMIN_ID,
@@ -337,15 +350,41 @@ async def optimize_and_assign(bot):
 
     routes = solution.get("routes", [])
     unassigned = solution.get("unassigned", [])
+
+    # Сообщим админу базовую сводку
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=f"🧠 ORS ответ: маршрутов {len(routes)}, нераспределены: {len(unassigned)}"
     )
 
     if not routes:
-        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет.")
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Маршрутов нет (все заявки могли попасть в unassigned).")
         return
 
+    # Соберём отображение id->order_no для unassigned
+    def map_unassigned(unassigned_list):
+        ids = []
+        if isinstance(unassigned_list, dict) and "jobs" in unassigned_list:
+            ids = [j.get("id") for j in unassigned_list.get("jobs", [])]
+        elif isinstance(unassigned_list, list):
+            # ORS иногда отдаёт просто список job-id или список словарей
+            for j in unassigned_list:
+                if isinstance(j, dict) and "id" in j:
+                    ids.append(j["id"])
+                elif isinstance(j, int):
+                    ids.append(j)
+        names = []
+        for jid in ids:
+            idx = row_index_by_job_id.get(jid)
+            if idx:
+                names.append(str(job_info[jid]["order_no"]))
+        return names
+
+    unas = map_unassigned(unassigned)
+    if unas:
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Нераспределены заявки: " + ", ".join(unas))
+
+    # === РАССЫЛКА ВОДИТЕЛЯМ ===
     for r in routes:
         vid = int(r["vehicle"])
         steps = r.get("steps", [])
@@ -353,8 +392,9 @@ async def optimize_and_assign(bot):
         driver_username = drv["username"] if drv else f"id_{vid}"
 
         job_steps = [s for s in steps if s.get("type") == "job"]
+        await bot.send_message(chat_id=ADMIN_ID, text=f"📦 vehicle {vid} ({driver_username}): задач {len(job_steps)}")
 
-        waypoints_latlon = []
+        waypoints_latlon = []  # только точки заказов (lat, lon)
         lines = []
         total_vol = 0.0
         total_wgt = 0.0
@@ -372,8 +412,9 @@ async def optimize_and_assign(bot):
 
             lon, lat = coords_cache.get(row_idx, (None, None))
             if lon and lat:
-                waypoints_latlon.append((lat, lon))
+                waypoints_latlon.append((float(lat), float(lon)))  # (lat, lon)
 
+            # обновления таблицы
             if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
             if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
             if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
@@ -396,22 +437,42 @@ async def optimize_and_assign(bot):
                 f"📞 Тел: {phone}\n"
                 f"🚘 Госномер: {drv.get('car_plate', '') if drv else ''}"
             )
-            per_stop_msgs.append((point_text, lat, lon, row_idx))
+            per_stop_msgs.append((point_text, float(lat) if lat else None, float(lon) if lon else None, row_idx))
+
+        # Построим общий маршрут с началом от склада
+        try:
+            s_lat = float(WAREHOUSE_LAT); s_lon = float(WAREHOUSE_LON)
+            full_latlon = [(s_lat, s_lon)] + waypoints_latlon if waypoints_latlon else [(s_lat, s_lon)]
+        except Exception:
+            full_latlon = waypoints_latlon[:]
 
         route_text = (
             "🧭 Оптимальный маршрут на сегодня:\n" +
             "\n".join(lines) +
             f"\n\nИтого погрузка: объём {total_vol:.1f} / вес {total_wgt:.1f}"
         )
-        route_link = build_google_maps_multistop(waypoints_latlon)
+        route_link = build_google_maps_multistop(full_latlon)
         route_text += f"\n📍 Открыть маршрут: {route_link}"
 
-        await bot.send_message(chat_id=vid, text=route_text)
+        try:
+            await bot.send_message(chat_id=vid, text=route_text)
+            await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Сводка отправлена {driver_username} (id={vid})")
+        except Exception as e:
+            logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
+            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не удалось написать {driver_username} (id={vid}). Ошибка: {e}\n\n{route_text}")
 
         for pt_text, lat, lon, row_idx in per_stop_msgs:
-            await bot.send_message(chat_id=vid, text=pt_text,
-                                   reply_markup=build_task_keyboard(lat, lon, row_idx))
+            try:
+                await bot.send_message(chat_id=vid, text=pt_text,
+                                       reply_markup=build_task_keyboard(lat, lon, row_idx))
+            except Exception as e:
+                logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ Карточка {row_idx} не доставлена {driver_username} (id={vid}). Ошибка: {e}\n\n{pt_text}"
+                )
 
+    # Итог админу
     await bot.send_message(
         chat_id=ADMIN_ID,
         text=f"✅ Оптимизация завершена. Маршруты: {len(routes)}. Не распределены: {len(unassigned)}."
@@ -420,10 +481,41 @@ async def optimize_and_assign(bot):
 # === КНОПКИ ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
     await query.answer()
-    if query.data == "optimize":
+
+    # 1) Кнопка запуска оптимизации
+    if data == "optimize":
         await optimize_and_assign(context.bot)
-        await query.edit_message_text("🔄 Маршруты построены и разосланы!")
+        try:
+            await query.edit_message_text("🔄 Маршруты построены и разосланы!")
+        except Exception:
+            pass
+        return
+
+    # 2) Отметка статуса по заявке
+    try:
+        if data.startswith("done:") or data.startswith("fail:"):
+            row_idx = int(data.split(":")[1])
+            status_value = "выполнено" if data.startswith("done:") else "не выполнено"
+
+            if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, status_value)
+            if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
+
+            # Снимем кнопки, чтобы не жали повторно
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            await query.message.reply_text(
+                f"✅ Статус по строке {row_idx} обновлён: {status_value.upper()}"
+            )
+            return
+    except Exception as e:
+        logger.error(f"Ошибка обработки кнопки {data}: {e}")
+        await query.message.reply_text("⚠️ Не удалось обновить статус. Сообщите админу.")
+        return
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
@@ -436,4 +528,3 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
-
