@@ -192,7 +192,8 @@ def order_no_from_col_A(row_idx: int) -> str:
 # === ЧТЕНИЕ EXCEL (любой зоопарк) ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     """
-    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка и как строки.
+    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка.
+    Никаких .str у Series — только чистые списки и Index.
     """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
@@ -204,8 +205,7 @@ def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     dfs = []
     for sheet_name in xls.sheet_names:
         try:
-            df = xls.parse(sheet_name, header=None, dtype=str)
-            df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else x)
+            df = xls.parse(sheet_name, header=None, dtype=object)
             dfs.append(df)
         except Exception as e:
             logger.warning(f"Лист '{sheet_name}' пропущен: {e}")
@@ -214,28 +214,49 @@ def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
 def detect_header_row(df: pd.DataFrame) -> int:
     """
     Находим строку, где реально лежат заголовки.
-    Критерий: ≥2 совпадений по известным названиям.
+    Критерий: ≥2 совпадений по известным названиям (без .str — работаем с Python-строками).
     """
     keys = {
         "Номер заявки", "Номер документа продажи", "Адрес доставки",
         "Телефон клиента", "Список товаров", "Кол-во товара", "Количество",
         "Дата доставки", "Вид перевозки"
     }
+    # Прямое совпадение
     for i in range(min(80, len(df))):
-        row = [str(x).strip() for x in df.iloc[i].tolist()]
+        row = [("" if pd.isna(x) else str(x)).strip() for x in df.iloc[i].tolist()]
         if sum(1 for c in row if c in keys) >= 2:
             return i
-    # запасной путь: ищем «номер» и «заяв»
+    # Эвристика по словам
     for i in range(min(160, len(df))):
-        row = [str(x).strip().lower() for x in df.iloc[i].tolist()]
+        row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
         if any(("номер" in c and "заяв" in c) for c in row):
             return i
     return 0
 
+def _make_headers_from_row(row_list: list[str]) -> pd.Index:
+    """Делаем индекс заголовков из списка строк + обеспечиваем уникальность имён."""
+    cleaned = []
+    for x in row_list:
+        s = ("" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
+        s = re.sub(r"[\r\n\t]+", " ", s).strip()
+        cleaned.append(s)
+    # уникальность
+    seen = {}
+    unique = []
+    for name in cleaned:
+        base = name or "col"
+        if base not in seen:
+            seen[base] = 1
+            unique.append(base)
+        else:
+            seen[base] += 1
+            unique.append(f"{base}_{seen[base]}")
+    return pd.Index(unique)
+
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     1) Находит строку заголовков.
-    2) Делает fill down (вместо объединений).
+    2) Делает fill down (вместо объединённых ячеек).
     3) Чистит номер заявки (оставляет только цифры).
     4) Приводит к колонкам Google-таблицы бота.
     """
@@ -243,14 +264,15 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     hdr = detect_header_row(df_raw)
-    headers = df_raw.iloc[hdr].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
+    header_row = df_raw.iloc[hdr].tolist()
+    headers = _make_headers_from_row(header_row)
     df = df_raw.iloc[hdr + 1:].copy()
     df.columns = headers
 
     # Убираем полностью пустые столбцы
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
 
-    # Fill-down (снятие объединений)
+    # Fill-down
     df = df.fillna(method="ffill")
 
     # кандидаты имён
@@ -281,21 +303,25 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_plan   = pick(src_cols["plan"])
     c_mode   = pick(src_cols["mode"])
 
+    logger.debug(f"Импорт: найдены колонки -> "
+                 f"order={c_order}, weight={c_weight}, volume={c_volume}, addr={c_addr}, phone={c_phone}, "
+                 f"items={c_items}, qty={c_qty}, plan={c_plan}, mode={c_mode}")
+
     target_cols = [
         "номер заявки", "Вес заказа", "Вид перевозки", "Телефон", "Объем заказа",
         "Адрес доставки", "Количество товара", "наименование", "План время дата"
     ]
     out = pd.DataFrame(columns=target_cols)
 
-    if c_order:
-        def clean_order(v: str) -> str:
-            s = (v or "").strip()
-            digits = re.sub(r"[^\d]", "", s)  # оставляем только цифры
-            return digits
-        out["номер заявки"] = df[c_order].astype(str).map(clean_order)
-    else:
-        # без номера заявки нам в гугл-таблицу нечего писать
-        return pd.DataFrame()
+    if not c_order:
+        return pd.DataFrame()  # без номера заявки — ничего не пишем
+
+    def clean_order(v) -> str:
+        s = ("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
+        digits = re.sub(r"[^\d]", "", s)  # оставим только цифры
+        return digits
+
+    out["номер заявки"] = df[c_order].map(clean_order)
 
     if c_weight: out["Вес заказа"]        = df[c_weight]
     out["Вид перевозки"]                  = df[c_mode] if c_mode else ""
@@ -338,7 +364,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
 
     try:
-        # читаем ВСЕ листы и собираем заявки
         frames = []
         for df_raw in read_excel_flex(tmp_path, document.file_name):
             try:
@@ -371,7 +396,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
 
-# === JOBS / VEHICLES / ORS ===
+# === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     jobs = []
     row_index_by_job_id = {}
@@ -652,7 +677,6 @@ async def optimize_and_assign(bot):
 
             lines.append(f"• №{order_no} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
 
-            # карточка точки
             row_dict = rows[row_idx - 2]
             plan_dt   = row_dict.get("План время дата", "")
             item_name = row_dict.get("наименование", "") or row_dict.get("Наименование", "")
