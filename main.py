@@ -1,19 +1,21 @@
 import logging
+import os
+import json
+import re
+import tempfile
+from datetime import datetime, timedelta
+from collections import defaultdict
+from math import radians, sin, cos, asin, sqrt
+
 import gspread
+import pandas as pd
+import requests
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters,
     CallbackQueryHandler, ContextTypes
 )
-from datetime import datetime, timedelta
-from collections import defaultdict
-import os
-import json
-import requests
-from oauth2client.service_account import ServiceAccountCredentials
-from math import radians, sin, cos, asin, sqrt
-import tempfile
-import pandas as pd
 
 # === ЛОГИ ===
 logging.basicConfig(level=logging.DEBUG)
@@ -130,23 +132,18 @@ def to_float(val, default=0.0):
 
 def _haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
+    dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
 def scale_volume_m3_to_units(vol_m3: float) -> int:
-    try:
-        v = float(vol_m3)
-    except Exception:
-        v = 0.0
+    try: v = float(vol_m3)
+    except Exception: v = 0.0
     return max(0, int(round(v * VOLUME_SCALE)))
 
 def scale_weight_kg_to_units(w_kg: float) -> int:
-    try:
-        w = float(w_kg)
-    except Exception:
-        w = 0.0
+    try: w = float(w_kg)
+    except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
 # === МАРШРУТНЫЕ ССЫЛКИ (Google Maps) ===
@@ -175,23 +172,16 @@ def build_point_route_url(lat: float, lon: float):
 def geocode_address(address):
     try:
         url = "https://api.openrouteservice.org/geocode/search"
-        params = {
-            "api_key": ORS_API_KEY,
-            "text": address,
-            "boundary.country": "RU",
-            "size": 1
-        }
+        params = {"api_key": ORS_API_KEY, "text": address, "boundary.country": "RU", "size": 1}
         if WAREHOUSE_LAT and WAREHOUSE_LON:
             params["focus.point.lat"] = float(WAREHOUSE_LAT)
             params["focus.point.lon"] = float(WAREHOUSE_LON)
-
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         features = response.json().get("features", [])
         if not features:
             logger.warning(f"Геокодер не нашёл адрес: {address}")
             return None, None
-
         lon, lat = features[0]["geometry"]["coordinates"]
         return lon, lat
     except Exception as e:
@@ -208,67 +198,116 @@ def order_no_from_col_A(row_idx: int) -> str:
         return str(row_idx)
 
 # === ПОМОЩНИКИ ДЛЯ ИМПОРТА EXCEL ===
-def pick_first_col(df: pd.DataFrame, names: list[str]) -> str | None:
-    """Вернуть название первой существующей колонки из списка вариантов."""
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
+def read_excel_flex(path: str, filename: str) -> pd.DataFrame:
+    """Читаем Excel без предположений о строке заголовков (всё строками, без потерь)."""
+    ext = os.path.splitext(filename.lower())[1]
+    engine = "openpyxl" if ext == ".xlsx" else None
+    try:
+        df = pd.read_excel(path, header=None, dtype=str, engine=engine)
+    except Exception:
+        df = pd.read_excel(path, header=None, dtype=str)
+    return df.applymap(lambda x: str(x).strip() if pd.notna(x) else x)
+
+def detect_header_row(df: pd.DataFrame) -> int:
+    """Находим строку, где реально лежат заголовки (учитывая шапки и объединения)."""
+    keys = {
+        "Номер заявки", "Номер документа продажи",
+        "Адрес доставки", "Телефон клиента", "Список товаров",
+        "Кол-во товара", "Количество", "Дата доставки", "Вид перевозки"
+    }
+    # Прямое совпадение
+    for i in range(min(60, len(df))):
+        row = [str(x).strip() for x in df.iloc[i].tolist()]
+        if sum(1 for c in row if c in keys) >= 2:
+            return i
+    # Эвристика по словам "номер" + "заяв"
+    for i in range(min(120, len(df))):
+        row = [str(x).strip().lower() for x in df.iloc[i].tolist()]
+        if any(("номер" in c and "заяв" in c) for c in row):
+            return i
+    return 0
 
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Делает:
-      - fill down вместо объединений,
-      - чистит 'Г-' в номере заявки,
-      - приводим к целевым колонкам таблицы бота.
+    1) Находит строку заголовков.
+    2) Делает fill down вместо объединений.
+    3) Чистит 'Г-' и любые нецифровые символы из номера.
+    4) Приводит к колонкам Google-таблицы бота.
     """
-    df = df_raw.copy()
+    # 1 — заголовки
+    hdr = detect_header_row(df_raw)
+    headers = df_raw.iloc[hdr].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
+    df = df_raw.iloc[hdr + 1:].copy()
+    df.columns = headers
+    # Убираем полностью пустые столбцы
+    df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan"]))).all(axis=0)]
+
+    # 2 — fill down
     df = df.fillna(method="ffill")
 
-    # Возможные имена колонок в исходном отчёте (вторая таблица)
+    # 3 — кандидаты имен колонок
     src_cols = {
         "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
-        "weight": ["Вес заказа", "Вес, кг"],
-        "volume": ["Объем заказа", "Объем, м3", "Объем м3"],
+        "weight": ["Вес заказа", "Вес, кг", "Вес"],
+        "volume": ["Объем заказа", "Объем, м3", "Объем м3", "Объем"],
         "addr":   ["Адрес доставки", "Адрес"],
         "phone":  ["Телефон клиента", "Телефон", "Контактный телефон"],
-        "items":  ["Список товаров", "Наименование товара", "Товар"],
+        "items":  ["Список товаров", "Наименование товара", "Товар", "Наименование"],
         "qty":    ["Кол-во товара", "Кол-во", "Количество"],
         "plan":   ["Дата доставки", "План время дата", "Дата и время доставки", "Дата отгрузки"],
         "mode":   ["Вид перевозки", "Тип доставки"],
     }
 
-    # Подбираем исходные имена
-    c_order = pick_first_col(df, src_cols["order"])
-    c_weight = pick_first_col(df, src_cols["weight"])
-    c_volume = pick_first_col(df, src_cols["volume"])
-    c_addr   = pick_first_col(df, src_cols["addr"])
-    c_phone  = pick_first_col(df, src_cols["phone"])
-    c_items  = pick_first_col(df, src_cols["items"])
-    c_qty    = pick_first_col(df, src_cols["qty"])
-    c_plan   = pick_first_col(df, src_cols["plan"])
-    c_mode   = pick_first_col(df, src_cols["mode"])
+    def pick(names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
 
-    # Собираем целевой датафрейм под заголовки текущей гугл-таблицы
+    c_order = pick(src_cols["order"])
+    c_weight = pick(src_cols["weight"])
+    c_volume = pick(src_cols["volume"])
+    c_addr   = pick(src_cols["addr"])
+    c_phone  = pick(src_cols["phone"])
+    c_items  = pick(src_cols["items"])
+    c_qty    = pick(src_cols["qty"])
+    c_plan   = pick(src_cols["plan"])
+    c_mode   = pick(src_cols["mode"])
+
+    # 4 — формируем целевые колонки под гугл-таблицу
     target_cols = [
         "номер заявки", "Вес заказа", "Вид перевозки", "Телефон", "Объем заказа",
-        "Адрес доставки", "Количество товара", "наименование", "План время дата",
-        # остальное (Статус, Водитель, Факт Дата и время, Гос номер, Километры) проставляются ботом
+        "Адрес доставки", "Количество товара", "наименование", "План время дата"
     ]
-
     out = pd.DataFrame(columns=target_cols)
-    if c_order:  out["номер заявки"]     = df[c_order].astype(str).str.replace("Г-", "", regex=False).str.strip()
-    if c_weight: out["Вес заказа"]       = df[c_weight]
-    if c_mode:   out["Вид перевозки"]    = df[c_mode]
-    if c_phone:  out["Телефон"]          = df[c_phone]
-    if c_volume: out["Объем заказа"]     = df[c_volume]
-    if c_addr:   out["Адрес доставки"]   = df[c_addr]
-    if c_qty:    out["Количество товара"]= df[c_qty]
-    if c_items:  out["наименование"]     = df[c_items]
-    if c_plan:   out["План время дата"]  = df[c_plan]
 
-    # Очистим полностью пустые строки по ключевым полям
-    out = out[~(out["номер заявки"].isna() | (out["номер заявки"].astype(str).str.strip() == ""))]
+    if c_order:
+        def clean_order(v: str) -> str:
+            s = (v or "").strip()
+            s = s.replace("Г-", "").replace("г-", "")
+            digits = re.sub(r"[^\d]", "", s)  # оставим только цифры
+            return digits if digits else s
+        out["номер заявки"] = df[c_order].astype(str).map(clean_order)
+
+    if c_weight: out["Вес заказа"]        = df[c_weight]
+    out["Вид перевозки"]                  = df[c_mode] if c_mode else ""
+    if c_phone:  out["Телефон"]           = df[c_phone]
+    if c_volume: out["Объем заказа"]      = df[c_volume]
+    if c_addr:   out["Адрес доставки"]    = df[c_addr]
+    if c_qty:    out["Количество товара"] = df[c_qty]
+    if c_items:  out["наименование"]      = df[c_items]
+
+    if c_plan:
+        try:
+            plan_series = pd.to_datetime(df[c_plan], dayfirst=True, errors="coerce")
+            out["План время дата"] = plan_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_plan].astype(str))
+        except Exception:
+            out["План время дата"] = df[c_plan].astype(str)
+    else:
+        out["План время дата"] = ""
+
+    # убираем строки без номера
+    out = out[out["номер заявки"].astype(str).str.strip() != ""]
     out = out.reset_index(drop=True)
     return out
 
@@ -281,37 +320,30 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     document = update.message.document
     if not document or not document.file_name.lower().endswith((".xls", ".xlsx")):
-        await update.message.reply_text("⚠️ Пришлите **Excel**-файл (.xls или .xlsx).")
+        await update.message.reply_text("⚠️ Пришлите Excel-файл (.xlsx или .xls).")
         return
 
-    # сохраняем временно
-    file = await document.get_file()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        await file.download_to_drive(tmp.name)
+    tg_file = await document.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(document.file_name)[1]) as tmp:
+        await tg_file.download_to_drive(tmp.name)
         tmp_path = tmp.name
 
     try:
-        # читаем excel в pandas
-        df_raw = pd.read_excel(tmp_path)
+        df_raw = read_excel_flex(tmp_path, document.file_name)
         df_ready = build_import_dataframe(df_raw)
 
-        if df_ready.empty:
-            await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки.")
+        if df_ready.empty or "номер заявки" not in df_ready.columns:
+            await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки/лист.")
             return
 
-        # Подготовим строки для дозаписи
         rows = df_ready.values.tolist()
-
-        # дозаписываем в конец
         sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
-        # клавиатура для старта оптимизации
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🧭 Распределить маршруты", callback_data="optimize")]
         ])
         await update.message.reply_text(
-            "✅ Файл загружен и **новые заявки добавлены**.\n"
-            "Нажмите кнопку ниже, чтобы распределить маршруты:",
+            f"✅ Файл обработан. Добавлено заявок: {len(rows)}.\nНажмите кнопку ниже:",
             reply_markup=keyboard
         )
     except Exception as e:
@@ -371,7 +403,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         job_info[job_id] = {
             "addr": addr,
             "order_no": order_no,   # для сообщений
-            "vol_m3": vol_m3,       # для человекочитаемой сводки
+            "vol_m3": vol_m3,       # для сводки
             "wgt_kg": wgt_kg,
             "tw": job.get("time_windows", None)
         }
@@ -381,8 +413,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 # === VEHICLES ===
 def build_vehicles_from_drivers():
     vehicles = []
-    s_lat = float(WAREHOUSE_LAT)
-    s_lon = float(WAREHOUSE_LON)
+    s_lat = float(WAREHOUSE_LAT); s_lon = float(WAREHOUSE_LON)
 
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
@@ -425,8 +456,7 @@ def reason_for_unassigned(job, vehicles):
             for tw in tws:
                 if not tw or len(tw) != 2:
                     continue
-                a1, a2 = tw
-                b1, b2 = vw
+                a1, a2 = tw; b1, b2 = vw
                 if max(a1, b1) <= min(a2, b2):
                     fits_time_any = True
 
@@ -441,10 +471,7 @@ def reason_for_unassigned(job, vehicles):
 # === ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
-    headers = {
-        "Authorization": ORS_API_KEY,
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
@@ -467,7 +494,7 @@ def extract_unassigned_ids(unassigned):
 # === TELEGRAM UI ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("Привет, админ! Пришли Excel-файл с заявками (.xlsx).")
+        await update.message.reply_text("Привет, админ! Пришли Excel-файл с заявками (.xlsx/.xls).")
     else:
         await update.message.reply_text(
             "Укажи параметры машины, например:\n`2.5, 500, А123ВС78`\n(объём м³, вес кг, госномер)",
@@ -522,7 +549,7 @@ async def optimize_and_assign(bot):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3).")
         return
 
-    # Распределяем сразу по всем доступным машинам
+    # Распределение
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
@@ -533,7 +560,6 @@ async def optimize_and_assign(bot):
     unassigned_raw = solution.get("unassigned", [])
     unassigned_ids = extract_unassigned_ids(unassigned_raw)
 
-    # Сообщим админу причины для unassigned (статусы не трогаем)
     if unassigned_ids:
         job_by_id = {j["id"]: j for j in jobs}
         lines = []
@@ -546,7 +572,7 @@ async def optimize_and_assign(bot):
               "\n\nДобавьте машины или перенесите нераспределённые заявки на другой день."
         await bot.send_message(chat_id=ADMIN_ID, text=msg)
 
-    # === РАССЫЛКА ВОДИТЕЛЯМ + пробеги ===
+    # Сводка по машинам
     routes_by_vehicle = {}
     for r in routes:
         vid = int(r["vehicle"])
@@ -558,7 +584,6 @@ async def optimize_and_assign(bot):
             except Exception:
                 route_dist_km = 0.0
         routes_by_vehicle[vid] = {"steps": steps, "route_km": route_dist_km}
-
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
@@ -570,6 +595,7 @@ async def optimize_and_assign(bot):
             text=f"📦 Машина {vid} ({username}): задач {len(data['steps'])}, пробег ~{data['route_km']:.1f} км"
         )
 
+    # разошлём водителям
     prev_leg_km_by_row.clear()
 
     for vid, data in routes_by_vehicle.items():
@@ -696,7 +722,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_done = data.startswith("done:")
             status_value = "выполнено" if is_done else "не выполнено"
 
-            # Пишем пробег сегмента в колонку N (если удалось посчитать)
+            # Пишем пробег сегмента в колонку N
             seg_km = prev_leg_km_by_row.get(row_idx)
             if seg_km is not None and COL_DISTANCE_N:
                 try:
@@ -707,11 +733,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, status_value)
             if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
             if not is_done:
-                # очистим водителя и ETA, чтобы заявка снова попала в распределение
                 if COL_DRIVER: sheet.update_cell(row_idx, COL_DRIVER, "")
                 if COL_ETA:    sheet.update_cell(row_idx, COL_ETA, "")
 
-            # снимаем клавиатуру у сообщения
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
