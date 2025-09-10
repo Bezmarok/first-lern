@@ -48,15 +48,13 @@ TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
 # === ЮНИТЫ ДЛЯ ORS (масштабирование до целых) ===
-VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))  # м³ -> литры (0.6 м³ -> 600)
-WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))     # кг -> кг (по умолчанию без изменения)
+VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))  # м³ -> литры
+WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))     # кг -> кг
 
 # === ПАМЯТЬ БОТА ===
-drivers_data = {}  # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
+drivers_data = {}            # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
 assigned_requests = defaultdict(list)
-
-# расстояние от предыдущей точки маршрута до текущей по row_idx (км)
-prev_leg_km_by_row = {}  # row_idx -> float
+prev_leg_km_by_row = {}      # row_idx -> float (сегментный пробег)
 
 # === КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
@@ -70,7 +68,7 @@ COL_DRIVER       = col("Водитель") or 11
 COL_UPDATED      = col("Факт Дата и время") or col("Время обновления") or 12
 COL_ETA          = col("ETA")
 COL_ADDRESS      = col("Адрес доставки")
-COL_ORDER_NUM    = col("НОМЕР заявки") or col("Номер заявки") or col("ID")  # для поиска, но в сообщениях берём ТОЛЬКО колонку A
+COL_ORDER_NUM    = col("НОМЕР заявки") or col("Номер заявки") or col("ID")
 COL_PLAN_DT      = col("План время дата")
 COL_ITEM_NAME    = col("наименование") or col("Наименование")
 COL_ITEM_QTY     = col("Количество товара")
@@ -79,9 +77,7 @@ COL_VOLUME       = col("Объем заказа")
 COL_WEIGHT       = col("Вес заказа")
 COL_SERVICE_MIN  = col("Время сервиса (мин)")
 COL_CAR_PLATE    = col("Гос номер")
-
-# Явно: колонка N = 14 (сюда пишем пробег от предыдущей точки)
-COL_DISTANCE_N   = 14
+COL_DISTANCE_N   = 14  # колонка «Километры»
 
 # === УТИЛИТЫ ===
 def now_human():
@@ -95,12 +91,9 @@ def try_parse_datetime(val: str):
         return None
     val = str(val).strip()
     fmts = [
-        "%d.%m.%Y %H:%M",
-        "%d.%m.%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%d.%m.%Y",
-        "%Y-%m-%d",
+        "%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y", "%Y-%m-%d",
     ]
     for f in fmts:
         try:
@@ -146,9 +139,8 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
-# === МАРШРУТНЫЕ ССЫЛКИ (Google Maps) ===
+# === МАРШРУТНЫЕ ССЫЛКИ ===
 def build_google_maps_multistop(latlon_list):
-    """latlon_list = [(lat, lon), ...] первая точка — склад."""
     if not latlon_list:
         return "https://www.google.com/maps"
     try:
@@ -197,31 +189,44 @@ def order_no_from_col_A(row_idx: int) -> str:
         logger.error(f"Не смогли прочитать колонку A для строки {row_idx}: {e}")
         return str(row_idx)
 
-# === ПОМОЩНИКИ ДЛЯ ИМПОРТА EXCEL ===
-def read_excel_flex(path: str, filename: str) -> pd.DataFrame:
-    """Читаем Excel без предположений о строке заголовков (всё строками, без потерь)."""
+# === ЧТЕНИЕ EXCEL (любой зоопарк) ===
+def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
+    """
+    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка и как строки.
+    """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
     try:
-        df = pd.read_excel(path, header=None, dtype=str, engine=engine)
+        xls = pd.ExcelFile(path, engine=engine)
     except Exception:
-        df = pd.read_excel(path, header=None, dtype=str)
-    return df.applymap(lambda x: str(x).strip() if pd.notna(x) else x)
+        xls = pd.ExcelFile(path)
+
+    dfs = []
+    for sheet_name in xls.sheet_names:
+        try:
+            df = xls.parse(sheet_name, header=None, dtype=str)
+            df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else x)
+            dfs.append(df)
+        except Exception as e:
+            logger.warning(f"Лист '{sheet_name}' пропущен: {e}")
+    return dfs
 
 def detect_header_row(df: pd.DataFrame) -> int:
-    """Находим строку, где реально лежат заголовки (учитывая шапки и объединения)."""
+    """
+    Находим строку, где реально лежат заголовки.
+    Критерий: ≥2 совпадений по известным названиям.
+    """
     keys = {
-        "Номер заявки", "Номер документа продажи",
-        "Адрес доставки", "Телефон клиента", "Список товаров",
-        "Кол-во товара", "Количество", "Дата доставки", "Вид перевозки"
+        "Номер заявки", "Номер документа продажи", "Адрес доставки",
+        "Телефон клиента", "Список товаров", "Кол-во товара", "Количество",
+        "Дата доставки", "Вид перевозки"
     }
-    # Прямое совпадение
-    for i in range(min(60, len(df))):
+    for i in range(min(80, len(df))):
         row = [str(x).strip() for x in df.iloc[i].tolist()]
         if sum(1 for c in row if c in keys) >= 2:
             return i
-    # Эвристика по словам "номер" + "заяв"
-    for i in range(min(120, len(df))):
+    # запасной путь: ищем «номер» и «заяв»
+    for i in range(min(160, len(df))):
         row = [str(x).strip().lower() for x in df.iloc[i].tolist()]
         if any(("номер" in c and "заяв" in c) for c in row):
             return i
@@ -230,22 +235,25 @@ def detect_header_row(df: pd.DataFrame) -> int:
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     1) Находит строку заголовков.
-    2) Делает fill down вместо объединений.
-    3) Чистит 'Г-' и любые нецифровые символы из номера.
+    2) Делает fill down (вместо объединений).
+    3) Чистит номер заявки (оставляет только цифры).
     4) Приводит к колонкам Google-таблицы бота.
     """
-    # 1 — заголовки
+    if df_raw.empty:
+        return pd.DataFrame()
+
     hdr = detect_header_row(df_raw)
     headers = df_raw.iloc[hdr].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
     df = df_raw.iloc[hdr + 1:].copy()
     df.columns = headers
-    # Убираем полностью пустые столбцы
-    df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan"]))).all(axis=0)]
 
-    # 2 — fill down
+    # Убираем полностью пустые столбцы
+    df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
+
+    # Fill-down (снятие объединений)
     df = df.fillna(method="ffill")
 
-    # 3 — кандидаты имен колонок
+    # кандидаты имён
     src_cols = {
         "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
         "weight": ["Вес заказа", "Вес, кг", "Вес"],
@@ -257,7 +265,6 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         "plan":   ["Дата доставки", "План время дата", "Дата и время доставки", "Дата отгрузки"],
         "mode":   ["Вид перевозки", "Тип доставки"],
     }
-
     def pick(names):
         for n in names:
             if n in df.columns:
@@ -274,7 +281,6 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_plan   = pick(src_cols["plan"])
     c_mode   = pick(src_cols["mode"])
 
-    # 4 — формируем целевые колонки под гугл-таблицу
     target_cols = [
         "номер заявки", "Вес заказа", "Вид перевозки", "Телефон", "Объем заказа",
         "Адрес доставки", "Количество товара", "наименование", "План время дата"
@@ -284,10 +290,12 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     if c_order:
         def clean_order(v: str) -> str:
             s = (v or "").strip()
-            s = s.replace("Г-", "").replace("г-", "")
-            digits = re.sub(r"[^\d]", "", s)  # оставим только цифры
-            return digits if digits else s
+            digits = re.sub(r"[^\d]", "", s)  # оставляем только цифры
+            return digits
         out["номер заявки"] = df[c_order].astype(str).map(clean_order)
+    else:
+        # без номера заявки нам в гугл-таблицу нечего писать
+        return pd.DataFrame()
 
     if c_weight: out["Вес заказа"]        = df[c_weight]
     out["Вид перевозки"]                  = df[c_mode] if c_mode else ""
@@ -306,8 +314,9 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     else:
         out["План время дата"] = ""
 
-    # убираем строки без номера
-    out = out[out["номер заявки"].astype(str).str.strip() != ""]
+    # убираем строки, где после чистки номера пусто
+    out["номер заявки"] = out["номер заявки"].astype(str).str.strip()
+    out = out[out["номер заявки"] != ""]
     out = out.reset_index(drop=True)
     return out
 
@@ -329,14 +338,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
 
     try:
-        df_raw = read_excel_flex(tmp_path, document.file_name)
-        df_ready = build_import_dataframe(df_raw)
+        # читаем ВСЕ листы и собираем заявки
+        frames = []
+        for df_raw in read_excel_flex(tmp_path, document.file_name):
+            try:
+                df_ready = build_import_dataframe(df_raw)
+                if not df_ready.empty:
+                    frames.append(df_ready)
+            except Exception as e:
+                logger.warning(f"Лист пропущен: {e}")
 
-        if df_ready.empty or "номер заявки" not in df_ready.columns:
+        if not frames:
             await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки/лист.")
             return
 
-        rows = df_ready.values.tolist()
+        df_all = pd.concat(frames, ignore_index=True)
+        if df_all.empty:
+            await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте формат.")
+            return
+
+        rows = df_all.values.tolist()
         sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
         keyboard = InlineKeyboardMarkup([
@@ -350,7 +371,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
 
-# === JOBS ===
+# === JOBS / VEHICLES / ORS ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     jobs = []
     row_index_by_job_id = {}
@@ -362,7 +383,6 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         driver_cell = (row.get("Водитель") or "").strip()
         addr = row.get("Адрес доставки")
 
-        # берём только свободные/не назначенные заявки
         if not addr or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
@@ -390,9 +410,9 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
         job = {
             "id": job_id,
-            "location": [float(lon), float(lat)],  # [lon, lat]
+            "location": [float(lon), float(lat)],
             "service": int(service_min * 60),
-            "amount": [vol_units, wgt_units],      # целые для ORS
+            "amount": [vol_units, wgt_units],
             "description": str(order_no)
         }
         if tw:
@@ -402,49 +422,40 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         row_index_by_job_id[job_id] = idx
         job_info[job_id] = {
             "addr": addr,
-            "order_no": order_no,   # для сообщений
-            "vol_m3": vol_m3,       # для сводки
+            "order_no": order_no,
+            "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
             "tw": job.get("time_windows", None)
         }
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
-# === VEHICLES ===
 def build_vehicles_from_drivers():
     vehicles = []
     s_lat = float(WAREHOUSE_LAT); s_lon = float(WAREHOUSE_LON)
-
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
     end = today + timedelta(days=3, hours=23, minutes=59)
-
     for user_id, drv in drivers_data.items():
         vol_cap_m3 = float(drv["volume"])
         wgt_cap_kg = float(drv["weight"])
         vehicles.append({
             "id": int(user_id),
             "profile": "driving-car",
-            "start": [float(s_lon), float(s_lat)],  # [lon, lat]
+            "start": [float(s_lon), float(s_lat)],
             "end":   [float(s_lon), float(s_lat)],
             "time_window": [to_unix(start), to_unix(end)],
-            "capacity": [
-                scale_volume_m3_to_units(vol_cap_m3),
-                scale_weight_kg_to_units(wgt_cap_kg)
-            ],
+            "capacity": [scale_volume_m3_to_units(vol_cap_m3), scale_weight_kg_to_units(wgt_cap_kg)],
             "description": drv["username"]
         })
     return vehicles
 
-# === Причины отказов (эвристики) ===
 def reason_for_unassigned(job, vehicles):
     reasons = []
     amount = job.get("amount", [0, 0])
     tws = job.get("time_windows", None)
-
     fits_capacity_any = False
     fits_time_any = False
-
     for v in vehicles:
         cap = v.get("capacity", [0, 0])
         if amount[0] <= cap[0] and amount[1] <= cap[1]:
@@ -459,16 +470,11 @@ def reason_for_unassigned(job, vehicles):
                 a1, a2 = tw; b1, b2 = vw
                 if max(a1, b1) <= min(a2, b2):
                     fits_time_any = True
-
-    if not fits_capacity_any:
-        reasons.append("превышение объёма/веса машины")
-    if not fits_time_any:
-        reasons.append("вне временного окна водителей")
-    if not reasons:
-        reasons.append("маршрутные/временные ограничения")
+    if not fits_capacity_any: reasons.append("превышение объёма/веса машины")
+    if not fits_time_any:     reasons.append("вне временного окна водителей")
+    if not reasons:           reasons.append("маршрутные/временные ограничения")
     return ", ".join(reasons)
 
-# === ORS ===
 def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
@@ -544,12 +550,10 @@ async def optimize_and_assign(bot):
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей.")
         return
 
-    # Лимиты ORS
     if len(jobs) > 50 or len(vehicles) > 3:
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3).")
         return
 
-    # Распределение
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
@@ -572,7 +576,6 @@ async def optimize_and_assign(bot):
               "\n\nДобавьте машины или перенесите нераспределённые заявки на другой день."
         await bot.send_message(chat_id=ADMIN_ID, text=msg)
 
-    # Сводка по машинам
     routes_by_vehicle = {}
     for r in routes:
         vid = int(r["vehicle"])
@@ -595,7 +598,6 @@ async def optimize_and_assign(bot):
             text=f"📦 Машина {vid} ({username}): задач {len(data['steps'])}, пробег ~{data['route_km']:.1f} км"
         )
 
-    # разошлём водителям
     prev_leg_km_by_row.clear()
 
     for vid, data in routes_by_vehicle.items():
@@ -603,7 +605,7 @@ async def optimize_and_assign(bot):
         driver_username = drv["username"] if drv else f"id_{vid}"
         job_steps = data["steps"]
 
-        waypoints_latlon = []  # (lat, lon)
+        waypoints_latlon = []
         total_vol_m3 = 0.0
         total_wgt_kg = 0.0
         lines = []
@@ -650,11 +652,12 @@ async def optimize_and_assign(bot):
 
             lines.append(f"• №{order_no} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
 
-            row = rows[row_idx - 2]
-            plan_dt   = row.get("План время дата", "")
-            item_name = row.get("наименование", "") or row.get("Наименование", "")
-            item_qty  = row.get("Количество товара", "")
-            phone     = row.get("Телефон", "")
+            # карточка точки
+            row_dict = rows[row_idx - 2]
+            plan_dt   = row_dict.get("План время дата", "")
+            item_name = row_dict.get("наименование", "") or row_dict.get("Наименование", "")
+            item_qty  = row_dict.get("Количество товара", "")
+            phone     = row_dict.get("Телефон", "")
             point_text = (
                 f"📦 Заявка №{order_no}\n"
                 f"📍 Адрес: {addr}\n"
@@ -715,14 +718,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # Обработка статусов
     try:
         if data.startswith("done:") or data.startswith("fail:"):
             row_idx = int(data.split(":")[1])
             is_done = data.startswith("done:")
             status_value = "выполнено" if is_done else "не выполнено"
 
-            # Пишем пробег сегмента в колонку N
             seg_km = prev_leg_km_by_row.get(row_idx)
             if seg_km is not None and COL_DISTANCE_N:
                 try:
@@ -741,10 +742,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # водителю
             await query.message.reply_text(f"✅ Статус обновлён: {status_value.upper()} (строка {row_idx})")
 
-            # админу
             try:
                 order_no = order_no_from_col_A(row_idx)
                 await context.bot.send_message(
