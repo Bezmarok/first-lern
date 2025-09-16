@@ -78,6 +78,7 @@ COL_SERVICE_MIN  = col("Время сервиса (мин)")
 COL_CAR_PLATE    = col("Гос номер")
 COL_DISTANCE_N   = 14
 
+# === УТИЛИТЫ ===
 def now_human():
     return datetime.now().strftime("%d.%m.%Y %H:%M")
 
@@ -197,11 +198,11 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
 
-# === новая функция для борьбы с дублями ===
+# === safe_col для борьбы с дублями ===
 def safe_col(df, name):
     col = df[name]
     if isinstance(col, pd.DataFrame):
-        logger.warning(f"Колонка '{name}' имеет дубликаты, беру первую")
+        logger.warning(f"Колонка '{name}' дублируется, беру первую")
         col = col.iloc[:, 0]
     return col
 
@@ -749,6 +750,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
 
