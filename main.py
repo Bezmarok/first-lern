@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
 import logging
 import os
 import json
@@ -31,7 +34,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 SHEET_NAME = "Cargodeliver"
-sheet = client.open(SHEET_NAME).sheet1
+sheet = client.open(SHEET_NAME).sheet1  # sheet1 как и просили
 
 # === ОКРУЖЕНИЕ ===
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
@@ -40,19 +43,23 @@ if not ORS_API_KEY:
 
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
+# 🚚 Координаты склада
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
 TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
-VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))
-WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))
+# === ЮНИТЫ ДЛЯ ORS (масштабирование до целых) ===
+VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))  # м³ -> литры
+WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))     # кг -> кг
 
-drivers_data = {}
+# === ПАМЯТЬ БОТА ===
+drivers_data = {}            # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
 assigned_requests = defaultdict(list)
-prev_leg_km_by_row = {}
+prev_leg_km_by_row = {}      # row_idx -> float (сегментный пробег)
 
+# === КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
 COL_INDEX = {name.strip(): i + 1 for i, name in enumerate(HEADERS)}
 
@@ -73,7 +80,7 @@ COL_VOLUME       = col("Объем заказа")
 COL_WEIGHT       = col("Вес заказа")
 COL_SERVICE_MIN  = col("Время сервиса (мин)")
 COL_CAR_PLATE    = col("Гос номер")
-COL_DISTANCE_N   = 14
+COL_DISTANCE_N   = 14  # колонка «Километры»
 
 # === УТИЛИТЫ ===
 def now_human():
@@ -87,7 +94,7 @@ def try_parse_datetime(val: str):
         return None
     val = str(val).strip()
     fmts = [
-        "%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M", "%d.%м.%Y %H:%M:%S",
         "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
         "%d.%m.%Y", "%Y-%m-%d",
     ]
@@ -135,8 +142,62 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
-# === ЧТЕНИЕ EXCEL ===
+# === МАРШРУТНЫЕ ССЫЛКИ ===
+def build_google_maps_multistop(latlon_list):
+    if not latlon_list:
+        return "https://www.google.com/maps"
+    try:
+        origin = f"{latlon_list[0][0]},{latlon_list[0][1]}"
+        destination = f"{latlon_list[-1][0]},{latlon_list[-1][1]}"
+        waypoints = "|".join([f"{lat},{lon}" for lat, lon in latlon_list[1:-1]]) if len(latlon_list) > 2 else ""
+        url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}"
+        if waypoints:
+            url += f"&waypoints={waypoints}"
+        return url
+    except Exception:
+        return "https://www.google.com/maps"
+
+def build_point_route_url(lat: float, lon: float):
+    try:
+        return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
+    except Exception:
+        return "https://www.google.com/maps"
+
+# === ГЕОКОДИНГ ===
+def geocode_address(address):
+    try:
+        url = "https://api.openrouteservice.org/geocode/search"
+        params = {"api_key": ORS_API_KEY, "text": address, "boundary.country": "RU", "size": 1}
+        if WAREHOUSE_LAT and WAREHOUSE_LON:
+            params["focus.point.lat"] = float(WAREHOUSE_LAT)
+            params["focus.point.lon"] = float(WAREHOUSE_LON)
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        features = response.json().get("features", [])
+        if not features:
+            logger.warning(f"Геокодер не нашёл адрес: {address}")
+            return None, None
+        lon, lat = features[0]["geometry"]["coordinates"]
+        return lon, lat
+    except Exception as e:
+        logger.error(f"Ошибка геокодинга: {e}")
+        return None, None
+
+# === Номер заявки строго из колонки A ===
+def order_no_from_col_A(row_idx: int) -> str:
+    try:
+        val = sheet.cell(row_idx, 1).value  # Колонка A
+        return str(val).strip() if val is not None else str(row_idx)
+    except Exception as e:
+        logger.error(f"Не смогли прочитать колонку A для строки {row_idx}: {e}")
+        return str(row_idx)
+
+# === ЧТЕНИЕ EXCEL (любой зоопарк) ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
+    """
+    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка.
+    Никаких .str у Series — только чистые списки и Index.
+    """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
     try:
@@ -154,18 +215,25 @@ def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     return dfs
 
 def detect_header_row(df: pd.DataFrame) -> int:
-    for i in range(min(100, len(df))):
+    """
+    Находим строку с заголовками.
+    1) Если встречаем "Номер заяв" или "№ заяв" — берём эту строку.
+    2) Иначе fallback на первую строку.
+    """
+    for i in range(min(120, len(df))):
         row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
-        if any("номер заявки" in c or "№ заявки" in c for c in row):
+        if any(("номер заяв" in c) or ("№ заяв" in c) for c in row):
             return i
     return 0
 
 def _make_headers_from_row(row_list: list[str]) -> pd.Index:
+    """Делаем индекс заголовков из списка строк + обеспечиваем уникальность имён."""
     cleaned = []
     for x in row_list:
         s = ("" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
         s = re.sub(r"[\r\n\t]+", " ", s).strip()
         cleaned.append(s)
+    # уникальность
     seen = {}
     unique = []
     for name in cleaned:
@@ -178,8 +246,21 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
 
-# === ИМПОРТ DATAFRAME ===
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Импорт под твой мэппинг:
+
+    Excel -> Google Sheets
+    - Номер заявки            -> номер заявки
+    - Дата доставки/Время    -> План время дата
+    - Список товаров         -> наименование
+    - Кол-во товара          -> Количество товара
+    - Объем заказа           -> Объем заказа
+    - Вес заказа             -> Вес заказа
+    - Адрес доставки         -> Адрес доставки
+    - Телефон клиента        -> Телефон
+    Остальное игнорируем.
+    """
     if df_raw.empty:
         return pd.DataFrame()
 
@@ -189,20 +270,32 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.iloc[hdr + 1:].copy()
     df.columns = headers
 
+    # Диагностика
+    try:
+        logger.debug(f"Найдены заголовки: {list(df.columns)}")
+        if "Номер заявки" in df.columns:
+            logger.debug(f"Примеры номеров заявок (raw): {df['Номер заявки'].head(5).tolist()}")
+    except Exception:
+        pass
+
+    # Убираем полностью пустые столбцы
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
+
+    # Fill-down
     df = df.fillna(method="ffill")
 
+    # кандидаты имён
     src_cols = {
-        "order":  ["Номер заявки"],
-        "plan":   ["Дата доставки", "Время доставки"],
-        "items":  ["Список товаров"],
-        "qty":    ["Кол-во товара"],
-        "volume": ["Объем заказа"],
-        "weight": ["Вес заказа"],
-        "addr":   ["Адрес доставки"],
-        "phone":  ["Телефон клиента"],
+        "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
+        "date":   ["Дата доставки", "Дата"],
+        "time":   ["Время доставки", "Время"],
+        "items":  ["Список товаров", "Наименование товара", "Товар", "Наименование"],
+        "qty":    ["Кол-во товара", "Кол-во", "Количество"],
+        "volume": ["Объем заказа", "Объем, м3", "Объем м3", "Объем"],
+        "weight": ["Вес заказа", "Вес, кг", "Вес"],
+        "addr":   ["Адрес доставки", "Адрес"],
+        "phone":  ["Телефон клиента", "Телефон", "Контактный телефон"],
     }
-
     def pick(names):
         for n in names:
             if n in df.columns:
@@ -210,7 +303,8 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         return None
 
     c_order = pick(src_cols["order"])
-    c_plan  = pick(src_cols["plan"])
+    c_date  = pick(src_cols["date"])
+    c_time  = pick(src_cols["time"])
     c_items = pick(src_cols["items"])
     c_qty   = pick(src_cols["qty"])
     c_volume= pick(src_cols["volume"])
@@ -218,6 +312,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_addr  = pick(src_cols["addr"])
     c_phone = pick(src_cols["phone"])
 
+    # Целевые колонки Google Sheet
     target_cols = [
         "номер заявки", "План время дата", "наименование", "Количество товара",
         "Объем заказа", "Вес заказа", "Адрес доставки", "Телефон"
@@ -226,30 +321,55 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     def clean_order(v) -> str:
         s = ("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
+        # удаляем "г/Г" и дефисы, потом оставляем только цифры и латиницу
         s = re.sub(r"[гГ\-]", "", s)
         cleaned = re.sub(r"[^0-9A-Za-z]", "", s)
         return cleaned
 
+    # Номер заявки
     if c_order:
         out["номер заявки"] = df[c_order].map(clean_order)
-    if c_plan:
-        plan_series = pd.to_datetime(df[c_plan], dayfirst=True, errors="coerce")
-        out["План время дата"] = plan_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_plan].astype(str))
-    if c_items:
-        out["наименование"] = df[c_items]
-    if c_qty:
-        out["Количество товара"] = df[c_qty]
-    if c_volume:
-        out["Объем заказа"] = df[c_volume]
-    if c_weight:
-        out["Вес заказа"] = df[c_weight]
-    if c_addr:
-        out["Адрес доставки"] = df[c_addr]
-    if c_phone:
-        out["Телефон"] = df[c_phone]
+        logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
+    else:
+        out["номер заявки"] = ""
 
-    out = out[out["номер заявки"].astype(str).str.strip() != ""]
+    # План время дата
+    if c_date and c_time:
+        try:
+            dt_series = pd.to_datetime(
+                df[c_date].astype(str).str.strip() + " " + df[c_time].astype(str).str.strip(),
+                dayfirst=True, errors="coerce"
+            )
+            out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(
+                (df[c_date].astype(str) + " " + df[c_time].astype(str)).str.strip()
+            )
+        except Exception:
+            out["План время дата"] = (df[c_date].astype(str) + " " + df[c_time].astype(str)).str.strip()
+    elif c_date:
+        try:
+            dt_series = pd.to_datetime(df[c_date], dayfirst=True, errors="coerce")
+            out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_date].astype(str))
+        except Exception:
+            out["План время дата"] = df[c_date].astype(str)
+    elif c_time:
+        out["План время дата"] = df[c_time].astype(str)
+    else:
+        out["План время дата"] = ""
+
+    # Остальные поля
+    out["наименование"]      = df[c_items]   if c_items  else ""
+    out["Количество товара"] = df[c_qty]     if c_qty    else ""
+    out["Объем заказа"]      = df[c_volume]  if c_volume else ""
+    out["Вес заказа"]        = df[c_weight]  if c_weight else ""
+    out["Адрес доставки"]    = df[c_addr]    if c_addr   else ""
+    out["Телефон"]           = df[c_phone]   if c_phone  else ""
+
+    # Уберём пустые номера
+    out["номер заявки"] = out["номер заявки"].astype(str).str.strip()
+    out = out[out["номер заявки"] != ""]
     out = out.reset_index(drop=True)
+
+    logger.debug(f"Итог к загрузке: строк {len(out)}")
     return out
 
 # === ОБРАБОТКА ФАЙЛОВ ОТ АДМИНА ===
@@ -440,12 +560,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        parts = update.message.text.split(",")
-        if len(parts) < 2:
-            raise ValueError("Неверный формат")
-        volume_str = parts[0]
-        weight_str = parts[1]
-        plate_str = parts[2] if len(parts) > 2 else ""
+        volume_str, weight_str, *rest = [x for x in update.message.text.split(",")]
+        plate_str = rest[0] if rest else ""
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
         drivers_data[user_id] = {
@@ -705,4 +821,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
-
