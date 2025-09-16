@@ -138,24 +138,13 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
-def geocode_address(address):
-    try:
-        url = "https://api.openrouteservice.org/geocode/search"
-        params = {"api_key": ORS_API_KEY, "text": address, "boundary.country": "RU", "size": 1}
-        if WAREHOUSE_LAT and WAREHOUSE_LON:
-            params["focus.point.lat"] = float(WAREHOUSE_LAT)
-            params["focus.point.lon"] = float(WAREHOUSE_LON)
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        features = response.json().get("features", [])
-        if not features:
-            logger.warning(f"Геокодер не нашёл адрес: {address}")
-            return None, None
-        lon, lat = features[0]["geometry"]["coordinates"]
-        return lon, lat
-    except Exception as e:
-        logger.error(f"Ошибка геокодинга: {e}")
-        return None, None
+# === safe_col для борьбы с дублями ===
+def safe_col(df, name):
+    col = df[name]
+    if isinstance(col, pd.DataFrame):
+        logger.warning(f"Колонка '{name}' дублируется, беру первую")
+        col = col.iloc[:, 0]
+    return col
 
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     ext = os.path.splitext(filename.lower())[1]
@@ -197,14 +186,6 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             seen[base] += 1
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
-
-# === safe_col для борьбы с дублями ===
-def safe_col(df, name):
-    col = df[name]
-    if isinstance(col, pd.DataFrame):
-        logger.warning(f"Колонка '{name}' дублируется, беру первую")
-        col = col.iloc[:, 0]
-    return col
 
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw.empty:
@@ -291,9 +272,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     out["Телефон"]           = safe_col(df, c_phone)   if c_phone  else ""
 
     if "номер заявки" in out.columns:
-        col_vals = out.loc[:, "номер заявки"]
-        if isinstance(col_vals, pd.DataFrame):
-            col_vals = col_vals.iloc[:, 0]
+        col_vals = safe_col(out, "номер заявки")
         col_vals = col_vals.fillna("").astype(str).str.strip()
         out = out[col_vals != ""]
     out = out.reset_index(drop=True)
@@ -750,6 +729,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
 
