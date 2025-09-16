@@ -191,10 +191,6 @@ def order_no_from_col_A(row_idx: int) -> str:
 
 # === ЧТЕНИЕ EXCEL (любой зоопарк) ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
-    """
-    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка.
-    Никаких .str у Series — только чистые списки и Index.
-    """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
     try:
@@ -214,33 +210,31 @@ def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
 def detect_header_row(df: pd.DataFrame) -> int:
     """
     Находим строку, где реально лежат заголовки.
-    Критерий: ≥2 совпадений по известным названиям (без .str — работаем с Python-строками).
+    1) Если встречаем "Номер заявки" (или вариант) — сразу возвращаем.
+    2) Иначе ищем ≥2 совпадения по известным названиям.
     """
+    for i in range(min(100, len(df))):
+        row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
+        if any("номер заявки" in c or "№ заявки" in c for c in row):
+            return i
+
     keys = {
         "Номер заявки", "Номер документа продажи", "Адрес доставки",
         "Телефон клиента", "Список товаров", "Кол-во товара", "Количество",
         "Дата доставки", "Вид перевозки"
     }
-    # Прямое совпадение
     for i in range(min(80, len(df))):
         row = [("" if pd.isna(x) else str(x)).strip() for x in df.iloc[i].tolist()]
         if sum(1 for c in row if c in keys) >= 2:
             return i
-    # Эвристика по словам
-    for i in range(min(160, len(df))):
-        row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
-        if any(("номер" in c and "заяв" in c) for c in row):
-            return i
     return 0
 
 def _make_headers_from_row(row_list: list[str]) -> pd.Index:
-    """Делаем индекс заголовков из списка строк + обеспечиваем уникальность имён."""
     cleaned = []
     for x in row_list:
         s = ("" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
         s = re.sub(r"[\r\n\t]+", " ", s).strip()
         cleaned.append(s)
-    # уникальность
     seen = {}
     unique = []
     for name in cleaned:
@@ -252,7 +246,6 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             seen[base] += 1
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
-
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     1) Находит строку заголовков.
@@ -794,3 +787,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
