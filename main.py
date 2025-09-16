@@ -43,23 +43,19 @@ if not ORS_API_KEY:
 
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
-# 🚚 Координаты склада
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
 TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
-# === ЮНИТЫ ДЛЯ ORS ===
 VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))
 WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))
 
-# === ПАМЯТЬ БОТА ===
 drivers_data = {}
 assigned_requests = defaultdict(list)
 prev_leg_km_by_row = {}
 
-# === КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
 COL_INDEX = {name.strip(): i + 1 for i, name in enumerate(HEADERS)}
 
@@ -82,7 +78,6 @@ COL_SERVICE_MIN  = col("Время сервиса (мин)")
 COL_CAR_PLATE    = col("Гос номер")
 COL_DISTANCE_N   = 14
 
-# === УТИЛИТЫ ===
 def now_human():
     return datetime.now().strftime("%d.%m.%Y %H:%M")
 
@@ -142,7 +137,6 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
-# === ГЕОКОДИНГ ===
 def geocode_address(address):
     try:
         url = "https://api.openrouteservice.org/geocode/search"
@@ -162,7 +156,6 @@ def geocode_address(address):
         logger.error(f"Ошибка геокодинга: {e}")
         return None, None
 
-# === Excel utils ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
@@ -204,6 +197,14 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
 
+# === новая функция для борьбы с дублями ===
+def safe_col(df, name):
+    col = df[name]
+    if isinstance(col, pd.DataFrame):
+        logger.warning(f"Колонка '{name}' имеет дубликаты, беру первую")
+        col = col.iloc[:, 0]
+    return col
+
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw.empty:
         return pd.DataFrame()
@@ -215,7 +216,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     logger.debug(f"Найдены заголовки: {list(df.columns)}")
     if "Номер заявки" in df.columns:
-        logger.debug(f"Примеры номеров заявок (raw): {df['Номер заявки'].head(5).tolist()}")
+        logger.debug(f"Примеры номеров заявок (raw): {safe_col(df,'Номер заявки').head(5).tolist()}")
 
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
     df = df.fillna(method="ffill")
@@ -236,6 +237,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             if n in df.columns:
                 return n
         return None
+
     c_order = pick(src_cols["order"])
     c_date  = pick(src_cols["date"])
     c_time  = pick(src_cols["time"])
@@ -258,38 +260,35 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         return re.sub(r"[^0-9A-Za-z]", "", s)
 
     if c_order:
-        out["номер заявки"] = df[c_order].map(clean_order)
+        out["номер заявки"] = safe_col(df, c_order).map(clean_order)
         logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
     else:
         out["номер заявки"] = ""
 
-    # План время дата
     if c_date and c_time:
-        try:
-            dt_series = pd.to_datetime(
-                df[c_date].astype(str).str.strip() + " " + df[c_time].astype(str).str.strip(),
-                dayfirst=True, errors="coerce"
-            )
-            out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(
-                (df[c_date].astype(str) + " " + df[c_time].astype(str)).str.strip()
-            )
-        except Exception:
-            out["План время дата"] = (df[c_date].astype(str) + " " + df[c_time].astype(str)).str.strip()
+        date_col = safe_col(df, c_date)
+        time_col = safe_col(df, c_time)
+        dt_series = pd.to_datetime(
+            date_col.astype(str).str.strip() + " " + time_col.astype(str).str.strip(),
+            dayfirst=True, errors="coerce"
+        )
+        out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(
+            (date_col.astype(str) + " " + time_col.astype(str)).str.strip()
+        )
     elif c_date:
-        out["План время дата"] = df[c_date].astype(str)
+        out["План время дата"] = safe_col(df, c_date).astype(str)
     elif c_time:
-        out["План время дата"] = df[c_time].astype(str)
+        out["План время дата"] = safe_col(df, c_time).astype(str)
     else:
         out["План время дата"] = ""
 
-    out["наименование"]      = df[c_items]   if c_items  else ""
-    out["Количество товара"] = df[c_qty]     if c_qty    else ""
-    out["Объем заказа"]      = df[c_volume]  if c_volume else ""
-    out["Вес заказа"]        = df[c_weight]  if c_weight else ""
-    out["Адрес доставки"]    = df[c_addr]    if c_addr   else ""
-    out["Телефон"]           = df[c_phone]   if c_phone  else ""
+    out["наименование"]      = safe_col(df, c_items)   if c_items  else ""
+    out["Количество товара"] = safe_col(df, c_qty)     if c_qty    else ""
+    out["Объем заказа"]      = safe_col(df, c_volume)  if c_volume else ""
+    out["Вес заказа"]        = safe_col(df, c_weight)  if c_weight else ""
+    out["Адрес доставки"]    = safe_col(df, c_addr)    if c_addr   else ""
+    out["Телефон"]           = safe_col(df, c_phone)   if c_phone  else ""
 
-    # безопасная фильтрация (борьба с дубликатами)
     if "номер заявки" in out.columns:
         col_vals = out.loc[:, "номер заявки"]
         if isinstance(col_vals, pd.DataFrame):
@@ -750,5 +749,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
