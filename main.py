@@ -55,9 +55,9 @@ VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))  # м³ -> литры
 WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))     # кг -> кг
 
 # === ПАМЯТЬ БОТА ===
-drivers_data = {}            # user_id -> {"volume": float, "weight": float, "username": str, "car_plate": str}
+drivers_data = {}
 assigned_requests = defaultdict(list)
-prev_leg_km_by_row = {}      # row_idx -> float (сегментный пробег)
+prev_leg_km_by_row = {}
 
 # === КОЛОНКИ ===
 HEADERS = sheet.row_values(1)
@@ -94,7 +94,7 @@ def try_parse_datetime(val: str):
         return None
     val = str(val).strip()
     fmts = [
-        "%d.%m.%Y %H:%M", "%d.%м.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S",
         "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
         "%d.%m.%Y", "%Y-%m-%d",
     ]
@@ -142,27 +142,6 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
-# === МАРШРУТНЫЕ ССЫЛКИ ===
-def build_google_maps_multistop(latlon_list):
-    if not latlon_list:
-        return "https://www.google.com/maps"
-    try:
-        origin = f"{latlon_list[0][0]},{latlon_list[0][1]}"
-        destination = f"{latlon_list[-1][0]},{latlon_list[-1][1]}"
-        waypoints = "|".join([f"{lat},{lon}" for lat, lon in latlon_list[1:-1]]) if len(latlon_list) > 2 else ""
-        url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}"
-        if waypoints:
-            url += f"&waypoints={waypoints}"
-        return url
-    except Exception:
-        return "https://www.google.com/maps"
-
-def build_point_route_url(lat: float, lon: float):
-    try:
-        return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
-    except Exception:
-        return "https://www.google.com/maps"
-
 # === ГЕОКОДИНГ ===
 def geocode_address(address):
     try:
@@ -186,25 +165,20 @@ def geocode_address(address):
 # === Номер заявки строго из колонки A ===
 def order_no_from_col_A(row_idx: int) -> str:
     try:
-        val = sheet.cell(row_idx, 1).value  # Колонка A
+        val = sheet.cell(row_idx, 1).value
         return str(val).strip() if val is not None else str(row_idx)
     except Exception as e:
         logger.error(f"Не смогли прочитать колонку A для строки {row_idx}: {e}")
         return str(row_idx)
 
-# === ЧТЕНИЕ EXCEL (любой зоопарк) ===
+# === ЧТЕНИЕ EXCEL ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
-    """
-    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка.
-    Никаких .str у Series — только чистые списки и Index.
-    """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
     try:
         xls = pd.ExcelFile(path, engine=engine)
     except Exception:
         xls = pd.ExcelFile(path)
-
     dfs = []
     for sheet_name in xls.sheet_names:
         try:
@@ -215,11 +189,6 @@ def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     return dfs
 
 def detect_header_row(df: pd.DataFrame) -> int:
-    """
-    Находим строку с заголовками.
-    1) Если встречаем "Номер заяв" или "№ заяв" — берём эту строку.
-    2) Иначе fallback на первую строку.
-    """
     for i in range(min(120, len(df))):
         row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
         if any(("номер заяв" in c) or ("№ заяв" in c) for c in row):
@@ -227,13 +196,11 @@ def detect_header_row(df: pd.DataFrame) -> int:
     return 0
 
 def _make_headers_from_row(row_list: list[str]) -> pd.Index:
-    """Делаем индекс заголовков из списка строк + обеспечиваем уникальность имён."""
     cleaned = []
     for x in row_list:
         s = ("" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
         s = re.sub(r"[\r\n\t]+", " ", s).strip()
         cleaned.append(s)
-    # уникальность
     seen = {}
     unique = []
     for name in cleaned:
@@ -247,44 +214,21 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
     return pd.Index(unique)
 
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Импорт под твой мэппинг:
-
-    Excel -> Google Sheets
-    - Номер заявки            -> номер заявки
-    - Дата доставки/Время    -> План время дата
-    - Список товаров         -> наименование
-    - Кол-во товара          -> Количество товара
-    - Объем заказа           -> Объем заказа
-    - Вес заказа             -> Вес заказа
-    - Адрес доставки         -> Адрес доставки
-    - Телефон клиента        -> Телефон
-    Остальное игнорируем.
-    """
     if df_raw.empty:
         return pd.DataFrame()
-
     hdr = detect_header_row(df_raw)
     header_row = df_raw.iloc[hdr].tolist()
     headers = _make_headers_from_row(header_row)
     df = df_raw.iloc[hdr + 1:].copy()
     df.columns = headers
-
-    # Диагностика
     try:
         logger.debug(f"Найдены заголовки: {list(df.columns)}")
         if "Номер заявки" in df.columns:
             logger.debug(f"Примеры номеров заявок (raw): {df['Номер заявки'].head(5).tolist()}")
     except Exception:
         pass
-
-    # Убираем полностью пустые столбцы
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
-
-    # Fill-down
     df = df.fillna(method="ffill")
-
-    # кандидаты имён
     src_cols = {
         "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
         "date":   ["Дата доставки", "Дата"],
@@ -301,7 +245,6 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             if n in df.columns:
                 return n
         return None
-
     c_order = pick(src_cols["order"])
     c_date  = pick(src_cols["date"])
     c_time  = pick(src_cols["time"])
@@ -311,29 +254,21 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_weight= pick(src_cols["weight"])
     c_addr  = pick(src_cols["addr"])
     c_phone = pick(src_cols["phone"])
-
-    # Целевые колонки Google Sheet
     target_cols = [
         "номер заявки", "План время дата", "наименование", "Количество товара",
         "Объем заказа", "Вес заказа", "Адрес доставки", "Телефон"
     ]
     out = pd.DataFrame(columns=target_cols)
-
     def clean_order(v) -> str:
         s = ("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
-        # удаляем "г/Г" и дефисы, потом оставляем только цифры и латиницу
         s = re.sub(r"[гГ\-]", "", s)
         cleaned = re.sub(r"[^0-9A-Za-z]", "", s)
         return cleaned
-
-    # Номер заявки
     if c_order:
         out["номер заявки"] = df[c_order].map(clean_order)
         logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
     else:
         out["номер заявки"] = ""
-
-    # План время дата
     if c_date and c_time:
         try:
             dt_series = pd.to_datetime(
@@ -355,20 +290,17 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         out["План время дата"] = df[c_time].astype(str)
     else:
         out["План время дата"] = ""
-
-    # Остальные поля
     out["наименование"]      = df[c_items]   if c_items  else ""
     out["Количество товара"] = df[c_qty]     if c_qty    else ""
     out["Объем заказа"]      = df[c_volume]  if c_volume else ""
     out["Вес заказа"]        = df[c_weight]  if c_weight else ""
     out["Адрес доставки"]    = df[c_addr]    if c_addr   else ""
     out["Телефон"]           = df[c_phone]   if c_phone  else ""
-
-    # Уберём пустые номера
-    out["номер заявки"] = out["номер заявки"].astype(str).str.strip()
-    out = out[out["номер заявки"] != ""]
+    # безопасная фильтрация
+    if "номер заявки" in out.columns:
+        col_vals = out["номер заявки"].fillna("").astype(str).str.strip()
+        out = out[col_vals != ""]
     out = out.reset_index(drop=True)
-
     logger.debug(f"Итог к загрузке: строк {len(out)}")
     return out
 
@@ -821,3 +753,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
