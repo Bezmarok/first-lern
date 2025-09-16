@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
 import logging
 import os
 import json
@@ -191,6 +194,10 @@ def order_no_from_col_A(row_idx: int) -> str:
 
 # === ЧТЕНИЕ EXCEL (любой зоопарк) ===
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
+    """
+    Возвращает список DataFrame (по каждому листу), прочитанных без заголовка.
+    Никаких .str у Series — только чистые списки и Index.
+    """
     ext = os.path.splitext(filename.lower())[1]
     engine = "openpyxl" if ext == ".xlsx" else None
     try:
@@ -213,28 +220,35 @@ def detect_header_row(df: pd.DataFrame) -> int:
     1) Если встречаем "Номер заявки" (или вариант) — сразу возвращаем.
     2) Иначе ищем ≥2 совпадения по известным названиям.
     """
+    # 1) Сначала ищем явное вхождение "номер заявки" или "№ заявки" в любой ячейке строки
     for i in range(min(100, len(df))):
         row = [("" if pd.isna(x) else str(x)).strip().lower() for x in df.iloc[i].tolist()]
-        if any("номер заявки" in c or "№ заявки" in c for c in row):
+        # используем простую проверку: подстрока "номер заявк" или "№ заявк"
+        if any("номер заяв" in c or "№ заяв" in c for c in row):
             return i
 
+    # 2) Если нет — старый критерий: как минимум 2 совпадения по ключевым заголовкам
     keys = {
         "Номер заявки", "Номер документа продажи", "Адрес доставки",
         "Телефон клиента", "Список товаров", "Кол-во товара", "Количество",
-        "Дата доставки", "Вид перевозки"
+        "Дата доставки", "Вид перевозки", "Объем заказа", "Вес заказа"
     }
     for i in range(min(80, len(df))):
         row = [("" if pd.isna(x) else str(x)).strip() for x in df.iloc[i].tolist()]
         if sum(1 for c in row if c in keys) >= 2:
             return i
+
+    # Фолбэк на 0
     return 0
 
 def _make_headers_from_row(row_list: list[str]) -> pd.Index:
+    """Делаем индекс заголовков из списка строк + обеспечиваем уникальность имён."""
     cleaned = []
     for x in row_list:
         s = ("" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x))
         s = re.sub(r"[\r\n\t]+", " ", s).strip()
         cleaned.append(s)
+    # уникальность
     seen = {}
     unique = []
     for name in cleaned:
@@ -246,12 +260,19 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
             seen[base] += 1
             unique.append(f"{base}_{seen[base]}")
     return pd.Index(unique)
+
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    1) Находит строку заголовков.
-    2) Делает fill down (вместо объединённых ячеек).
-    3) Чистит номер заявки (оставляет только цифры).
-    4) Приводит к колонкам Google-таблицы бота.
+    Упрощённая версия импорта, адаптированная под твой мэппинг:
+    - Номер заявки -> номер заявки
+    - Дата доставки + Время доставки -> План время дата
+    - Список товаров -> наименование
+    - Кол-во товара -> Количество товара
+    - Объем заказа -> Объем заказа
+    - Вес заказа -> Вес заказа
+    - Адрес доставки -> Адрес доставки
+    - Телефон клиента -> Телефон
+    Удаляет лишние колонки и возвращает DataFrame, готовый для append_rows.
     """
     if df_raw.empty:
         return pd.DataFrame()
@@ -265,21 +286,22 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Убираем полностью пустые столбцы
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
 
-    # Fill-down
+    # Fill-down (вместо объединённых ячеек)
     df = df.fillna(method="ffill")
 
-    # кандидаты имён
+    # кандидаты имён (как в файле админа)
     src_cols = {
         "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
-        "weight": ["Вес заказа", "Вес, кг", "Вес"],
-        "volume": ["Объем заказа", "Объем, м3", "Объем м3", "Объем"],
-        "addr":   ["Адрес доставки", "Адрес"],
-        "phone":  ["Телефон клиента", "Телефон", "Контактный телефон"],
+        "date":   ["Дата доставки", "Дата", "Дата отгрузки"],
+        "time":   ["Время доставки", "Время"],
         "items":  ["Список товаров", "Наименование товара", "Товар", "Наименование"],
         "qty":    ["Кол-во товара", "Кол-во", "Количество"],
-        "plan":   ["Дата доставки", "План время дата", "Дата и время доставки", "Дата отгрузки"],
-        "mode":   ["Вид перевозки", "Тип доставки"],
+        "volume": ["Объем заказа", "Объем, м3", "Объем м3", "Объем"],
+        "weight": ["Вес заказа", "Вес, кг", "Вес"],
+        "addr":   ["Адрес доставки", "Адрес"],
+        "phone":  ["Телефон клиента", "Телефон", "Контактный телефон"],
     }
+
     def pick(names):
         for n in names:
             if n in df.columns:
@@ -287,53 +309,70 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         return None
 
     c_order = pick(src_cols["order"])
-    c_weight = pick(src_cols["weight"])
-    c_volume = pick(src_cols["volume"])
-    c_addr   = pick(src_cols["addr"])
-    c_phone  = pick(src_cols["phone"])
-    c_items  = pick(src_cols["items"])
-    c_qty    = pick(src_cols["qty"])
-    c_plan   = pick(src_cols["plan"])
-    c_mode   = pick(src_cols["mode"])
+    c_date  = pick(src_cols["date"])
+    c_time  = pick(src_cols["time"])
+    c_items = pick(src_cols["items"])
+    c_qty   = pick(src_cols["qty"])
+    c_volume= pick(src_cols["volume"])
+    c_weight= pick(src_cols["weight"])
+    c_addr  = pick(src_cols["addr"])
+    c_phone = pick(src_cols["phone"])
 
-    logger.debug(f"Импорт: найдены колонки -> "
-                 f"order={c_order}, weight={c_weight}, volume={c_volume}, addr={c_addr}, phone={c_phone}, "
-                 f"items={c_items}, qty={c_qty}, plan={c_plan}, mode={c_mode}")
-
+    # Целевые колонки в формате Google Sheets бота
     target_cols = [
-        "номер заявки", "Вес заказа", "Вид перевозки", "Телефон", "Объем заказа",
-        "Адрес доставки", "Количество товара", "наименование", "План время дата"
+        "номер заявки", "План время дата", "наименование", "Количество товара",
+        "Объем заказа", "Вес заказа", "Адрес доставки", "Телефон"
     ]
     out = pd.DataFrame(columns=target_cols)
-
-    if not c_order:
-        return pd.DataFrame()  # без номера заявки — ничего не пишем
 
     def clean_order(v) -> str:
         s = ("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
         digits = re.sub(r"[^\d]", "", s)  # оставим только цифры
         return digits
 
-    out["номер заявки"] = df[c_order].map(clean_order)
+    # Номер заявки
+    if c_order:
+        out["номер заявки"] = df[c_order].map(clean_order)
+    else:
+        out["номер заявки"] = ""
 
-    if c_weight: out["Вес заказа"]        = df[c_weight]
-    out["Вид перевозки"]                  = df[c_mode] if c_mode else ""
-    if c_phone:  out["Телефон"]           = df[c_phone]
-    if c_volume: out["Объем заказа"]      = df[c_volume]
-    if c_addr:   out["Адрес доставки"]    = df[c_addr]
-    if c_qty:    out["Количество товара"] = df[c_qty]
-    if c_items:  out["наименование"]      = df[c_items]
-
-    if c_plan:
+    # План время дата — объединяем дату и время если есть, в формат "dd.mm.YYYY HH:MM"
+    if c_date and c_time:
         try:
-            plan_series = pd.to_datetime(df[c_plan], dayfirst=True, errors="coerce")
-            out["План время дата"] = plan_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_plan].astype(str))
+            dt_series = pd.to_datetime(df[c_date].astype(str).str.strip() + " " + df[c_time].astype(str).str.strip(),
+                                       dayfirst=True, errors="coerce")
+            out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_date].astype(str))
         except Exception:
-            out["План время дата"] = df[c_plan].astype(str)
+            out["План время дата"] = df[c_date].astype(str)
+    elif c_date:
+        try:
+            dt_series = pd.to_datetime(df[c_date], dayfirst=True, errors="coerce")
+            out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(df[c_date].astype(str))
+        except Exception:
+            out["План время дата"] = df[c_date].astype(str)
     else:
         out["План время дата"] = ""
 
-    # убираем строки, где после чистки номера пусто
+    # Остальные простые маппинги
+    if c_items:  out["наименование"]      = df[c_items].astype(str)
+    else:        out["наименование"]      = ""
+
+    if c_qty:    out["Количество товара"] = df[c_qty].astype(str)
+    else:        out["Количество товара"] = ""
+
+    if c_volume: out["Объем заказа"]      = df[c_volume].astype(str)
+    else:        out["Объем заказа"]      = ""
+
+    if c_weight: out["Вес заказа"]        = df[c_weight].astype(str)
+    else:        out["Вес заказа"]        = ""
+
+    if c_addr:   out["Адрес доставки"]    = df[c_addr].astype(str)
+    else:        out["Адрес доставки"]    = ""
+
+    if c_phone:  out["Телефон"]           = df[c_phone].astype(str)
+    else:        out["Телефон"]           = ""
+
+    # Обрезаем строки без номера заявки
     out["номер заявки"] = out["номер заявки"].astype(str).str.strip()
     out = out[out["номер заявки"] != ""]
     out = out.reset_index(drop=True)
@@ -527,7 +566,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        volume_str, weight_str, plate_str = update.message.text.split(",")
+        parts = update.message.text.split(",")
+        if len(parts) < 2:
+            raise ValueError("Неверный формат")
+        volume_str = parts[0]
+        weight_str = parts[1]
+        plate_str = parts[2] if len(parts) > 2 else ""
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
         drivers_data[user_id] = {
@@ -787,5 +831,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
-
-
