@@ -79,6 +79,31 @@ COL_CAR_PLATE    = col("Гос номер")
 COL_DISTANCE_N   = 14
 
 # === УТИЛИТЫ ===
+def order_no_from_col_A(row_idx: int) -> str:
+    """
+    Возвращает номер заявки по строке Google Sheets.
+    Сначала пытается взять из колонки 'номер заявки', если нет — из первой колонки (A).
+    """
+    try:
+        headers = sheet.row_values(1)
+        # ищем колонку с названием "номер заявки"
+        col_idx = None
+        for i, h in enumerate(headers, start=1):
+            if h.strip().lower() in ["номер заявки", "номер заявки", "id", "заявка", "номер"]:  
+                col_idx = i
+                break
+
+        if not col_idx:
+            col_idx = 1  # fallback на первую колонку
+
+        val = sheet.cell(row_idx, col_idx).value
+        if val:
+            return str(val).strip()
+        return f"{row_idx}"
+    except Exception as e:
+        logger.warning(f"Не удалось получить номер заявки из строки {row_idx}: {e}")
+        return f"{row_idx}"
+
 def now_human():
     return datetime.now().strftime("%d.%m.%Y %H:%M")
 
