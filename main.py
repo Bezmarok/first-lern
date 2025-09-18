@@ -201,7 +201,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         sample_col = safe_col(df, "Номер заявки")
         logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
 
-    # фикс: удаляем пустые колонки корректно
+    # удаляем полностью пустые колонки
     df = df.loc[:, ~df.apply(lambda col: col.astype(str).str.strip().isin(["", "nan", "None"]).all())]
     df = df.ffill()
 
@@ -285,9 +285,22 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     else:
         out["План время дата"] = ""
 
-    if "номер заявки" in out.columns:
-        col_vals = safe_col(out, "номер заявки").fillna("").astype(str).str.strip()
-        out = out[col_vals != ""]
+    # фильтрация мусора (шапки типа "Доставка товара клиенту")
+    out = out[out["наименование"].astype(str).str.strip() != "Доставка товара клиенту"]
+
+    # --- группировка по номеру заявки ---
+    if not out.empty and "номер заявки" in out.columns:
+        agg_funcs = {
+            "Вес заказа": "sum",
+            "Вид перевозки": "first",
+            "Телефон": "first",
+            "Объем заказа": "sum",
+            "Адрес доставки": "first",
+            "Количество товара": "sum",
+            "наименование": lambda x: ", ".join([str(v).strip() for v in x if v and v.strip() != ""]),
+            "План время дата": "first",
+        }
+        out = out.groupby("номер заявки", as_index=False).agg(agg_funcs)
 
     out = out.reset_index(drop=True)
     logger.debug(f"Итог к загрузке: строк {len(out)}")
