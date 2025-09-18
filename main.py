@@ -202,7 +202,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         if hasattr(sample_col, "astype"):
             logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
 
-    df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
+    df = df.loc[:, ~df.apply(lambda col: col.astype(str).str.strip().isin(["", "nan", "None"]).all())]
     df = df.fillna(method="ffill")
 
     src_cols = {
