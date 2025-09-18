@@ -235,9 +235,17 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_addr   = pick(src_cols["addr"])
     c_phone  = pick(src_cols["phone"])
 
+    # порядок колонок под Google Sheets
     target_cols = [
-        "номер заявки", "План время дата", "наименование", "Количество товара",
-        "Объем заказа", "Вес заказа", "Адрес доставки", "Телефон"
+        "номер заявки",        # A
+        "Вес заказа",          # B
+        "Вид перевозки",       # C
+        "Телефон",             # D
+        "Объем заказа",        # E
+        "Адрес доставки",      # F
+        "Количество товара",   # G
+        "наименование",        # H
+        "План время дата"      # I
     ]
     out = pd.DataFrame(columns=target_cols)
 
@@ -251,6 +259,14 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
     else:
         out["номер заявки"] = ""
+
+    out["Вес заказа"]        = safe_col(df, c_weight) if c_weight else ""
+    out["Вид перевозки"]     = ""  # в файле нет, оставляем пустым
+    out["Телефон"]           = safe_col(df, c_phone) if c_phone else ""
+    out["Объем заказа"]      = safe_col(df, c_volume) if c_volume else ""
+    out["Адрес доставки"]    = safe_col(df, c_addr)  if c_addr   else ""
+    out["Количество товара"] = safe_col(df, c_qty)   if c_qty    else ""
+    out["наименование"]      = safe_col(df, c_items) if c_items  else ""
 
     if c_date and c_time:
         date_col = safe_col(df, c_date)
@@ -268,13 +284,6 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         out["План время дата"] = safe_col(df, c_time).astype(str)
     else:
         out["План время дата"] = ""
-
-    out["наименование"]      = safe_col(df, c_items)   if c_items  else ""
-    out["Количество товара"] = safe_col(df, c_qty)     if c_qty    else ""
-    out["Объем заказа"]      = safe_col(df, c_volume)  if c_volume else ""
-    out["Вес заказа"]        = safe_col(df, c_weight)  if c_weight else ""
-    out["Адрес доставки"]    = safe_col(df, c_addr)    if c_addr   else ""
-    out["Телефон"]           = safe_col(df, c_phone)   if c_phone  else ""
 
     if "номер заявки" in out.columns:
         col_vals = safe_col(out, "номер заявки").fillna("").astype(str).str.strip()
