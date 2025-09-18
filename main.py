@@ -49,7 +49,9 @@ WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
-VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))
+# ⚖️ Масштабирование единиц
+# Теперь считаем объём прямо в м³, а вес прямо в кг
+VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1"))
 WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))
 
 drivers_data = {}
