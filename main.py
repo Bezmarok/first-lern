@@ -198,7 +198,9 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     logger.debug(f"Найдены заголовки: {list(df.columns)}")
     if "Номер заявки" in df.columns:
-        logger.debug(f"Примеры номеров заявок (raw): {safe_col(df,'Номер заявки').head(5).tolist()}")
+        sample_col = safe_col(df, "Номер заявки")
+        if hasattr(sample_col, "astype"):
+            logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
 
     df = df.loc[:, ~(df.isna() | (df.astype(str).str.strip().isin(["", "nan", "None"]))).all(axis=0)]
     df = df.fillna(method="ffill")
@@ -222,7 +224,8 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
                 if target.lower() in col_norm:
                     return col
         return None
-    c_order = pick(src_cols["order"])
+
+        c_order = pick(src_cols["order"])
     c_date  = pick(src_cols["date"])
     c_time  = pick(src_cols["time"])
     c_items = pick(src_cols["items"])
@@ -244,7 +247,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         return re.sub(r"[^0-9A-Za-z]", "", s)
 
     if c_order:
-        out["номер заявки"] = safe_col(df, c_order).map(clean_order)
+        out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order)
         logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
     else:
         out["номер заявки"] = ""
@@ -331,6 +334,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
+
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     jobs = []
@@ -728,3 +732,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
