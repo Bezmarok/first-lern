@@ -204,15 +204,15 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df.fillna(method="ffill")
 
     src_cols = {
-        "order":  ["Номер заявки", "№ заявки", "Номер документа продажи"],
-        "date":   ["Дата доставки", "Дата"],
-        "time":   ["Время доставки", "Время"],
-        "items":  ["Список товаров", "Наименование товара", "Товар", "Наименование"],
-        "qty":    ["Кол-во товара", "Кол-во", "Количество"],
-        "volume": ["Объем заказа", "Объем, м3", "Объем м3", "Объем"],
-        "weight": ["Вес заказа", "Вес, кг", "Вес"],
-        "addr":   ["Адрес доставки", "Адрес"],
-        "phone":  ["Телефон клиента", "Телефон", "Контактный телефон"],
+        "order":  ["Номер заявки"],   # только этот столбец
+        "date":   ["Дата доставки"],
+        "time":   ["Время доставки"],
+        "items":  ["Список товаров"],
+        "qty":    ["Кол-во товара"],
+        "volume": ["Объем заказа"],
+        "weight": ["Вес заказа"],
+        "addr":   ["Адрес доставки"],
+        "phone":  ["Телефон клиента"],
     }
     def pick(names):
         for n in names:
@@ -729,6 +729,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
 
 
