@@ -199,11 +199,11 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     logger.debug(f"Найдены заголовки: {list(df.columns)}")
     if "Номер заявки" in df.columns:
         sample_col = safe_col(df, "Номер заявки")
-        if hasattr(sample_col, "astype"):
-            logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
+        logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
 
+    # фикс: удаляем пустые колонки корректно
     df = df.loc[:, ~df.apply(lambda col: col.astype(str).str.strip().isin(["", "nan", "None"]).all())]
-    df = df.fillna(method="ffill")
+    df = df.ffill()
 
     src_cols = {
         "order":  ["Номер заявки"],
@@ -225,15 +225,15 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
                     return col
         return None
 
-        c_order = pick(src_cols["order"])
-    c_date  = pick(src_cols["date"])
-    c_time  = pick(src_cols["time"])
-    c_items = pick(src_cols["items"])
-    c_qty   = pick(src_cols["qty"])
-    c_volume= pick(src_cols["volume"])
-    c_weight= pick(src_cols["weight"])
-    c_addr  = pick(src_cols["addr"])
-    c_phone = pick(src_cols["phone"])
+    c_order  = pick(src_cols["order"])
+    c_date   = pick(src_cols["date"])
+    c_time   = pick(src_cols["time"])
+    c_items  = pick(src_cols["items"])
+    c_qty    = pick(src_cols["qty"])
+    c_volume = pick(src_cols["volume"])
+    c_weight = pick(src_cols["weight"])
+    c_addr   = pick(src_cols["addr"])
+    c_phone  = pick(src_cols["phone"])
 
     target_cols = [
         "номер заявки", "План время дата", "наименование", "Количество товара",
@@ -242,7 +242,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(columns=target_cols)
 
     def clean_order(v) -> str:
-        s = ("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
+        s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
         s = re.sub(r"[гГ\-]", "", s)
         return re.sub(r"[^0-9A-Za-z]", "", s)
 
@@ -277,11 +277,10 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     out["Телефон"]           = safe_col(df, c_phone)   if c_phone  else ""
 
     if "номер заявки" in out.columns:
-        col_vals = safe_col(out, "номер заявки")
-        col_vals = col_vals.fillna("").astype(str).str.strip()
+        col_vals = safe_col(out, "номер заявки").fillna("").astype(str).str.strip()
         out = out[col_vals != ""]
-    out = out.reset_index(drop=True)
 
+    out = out.reset_index(drop=True)
     logger.debug(f"Итог к загрузке: строк {len(out)}")
     return out
 
