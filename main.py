@@ -384,17 +384,25 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
     coords_cache = {}
     job_info = {}
 
-    for idx, row in enumerate(rows, start=start_row_idx):
-        status = (row.get("Статус") or "").strip().lower()
-        driver_cell = (row.get("Водитель") or "").strip()
-        addr = row.get("Адрес доставки")
+    # убираем лишние хвосты типа "кв. 99" или "офис 12" для геокодинга
+    def clean_address_for_geocode(addr: str) -> str:
+        if not addr:
+            return ""
+        return re.sub(r"(кв\.?\s*\d+.*)|(офис\s*\d+.*)", "", addr, flags=re.IGNORECASE).strip()
 
-        if not addr or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
+    for idx, row in enumerate(rows, start=start_row_idx):
+        status = str(row.get("Статус", "")).strip().lower()
+        driver_cell = str(row.get("Водитель", "")).strip()
+        addr_raw = str(row.get("Адрес доставки", "")).strip()
+
+        # пропускаем пустые адреса и уже назначенные/закрытые заявки
+        if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
-        lon, lat = geocode_address(addr)
+        addr_for_geo = clean_address_for_geocode(addr_raw)
+        lon, lat = geocode_address(addr_for_geo)
         if not (lon and lat):
-            logger.warning(f"Пропущена заявка {idx} — нет координат: {addr}")
+            logger.warning(f"Пропущена заявка {idx} — не удалось геокодить: {addr_for_geo}")
             continue
 
         coords_cache[idx] = (float(lon), float(lat))
@@ -412,7 +420,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         wgt_units = scale_weight_kg_to_units(wgt_kg)
 
         order_no = order_no_from_col_A(idx)
-        job_id = idx  # технический int для ORS
+        job_id = idx  # технический id для ORS
 
         job = {
             "id": job_id,
@@ -427,7 +435,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         jobs.append(job)
         row_index_by_job_id[job_id] = idx
         job_info[job_id] = {
-            "addr": addr,
+            "addr": addr_raw,  # тут сохраняем полный адрес (с кв/офис)
+            "addr_geo": addr_for_geo,  # адрес для геокодинга
             "order_no": order_no,
             "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
