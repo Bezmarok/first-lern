@@ -138,6 +138,27 @@ def scale_weight_kg_to_units(w_kg: float) -> int:
     except Exception: w = 0.0
     return max(0, int(round(w * WEIGHT_SCALE)))
 
+def geocode_address(address: str):
+    """
+    Геокодирование адреса через ORS Pelias.
+    Возвращает (lon, lat) или (None, None), если не нашли.
+    """
+    try:
+        url = "https://api.openrouteservice.org/geocode/search"
+        params = {"api_key": ORS_API_KEY, "text": address, "size": 1, "lang": "ru"}
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        feats = data.get("features", [])
+        if feats:
+            coords = feats[0]["geometry"]["coordinates"]  # [lon, lat]
+            lon, lat = float(coords[0]), float(coords[1])
+            return lon, lat
+        logger.warning(f"Геокодер ORS не нашёл координаты: {address}")
+    except Exception as e:
+        logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
+    return (None, None)
+
 # === safe_col для борьбы с дублями ===
 def safe_col(df, name):
     col = df[name]
