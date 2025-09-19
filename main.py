@@ -51,8 +51,8 @@ DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
 # ⚖️ Масштабирование единиц
 # Теперь считаем объём прямо в м³, а вес прямо в кг
-VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1"))
-WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))
+VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))
+WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1000"))
 
 drivers_data = {}
 assigned_requests = defaultdict(list)
@@ -911,4 +911,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
+
 
