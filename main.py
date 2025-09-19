@@ -201,6 +201,26 @@ def geocode_address(address: str):
     except Exception as e:
         logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
     return (None, None)
+import urllib.parse
+
+def build_point_route_url(lat: float | None, lon: float | None) -> str:
+    if lat is None or lon is None:
+        return "https://maps.google.com"
+    return f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f}%2C{lon:.6f}&travelmode=driving"
+
+def build_google_maps_multistop(points: list[tuple[float, float]]) -> str:
+    # points: [(lat, lon), ...] где points[0] — склад
+    if not points:
+        return "https://maps.google.com"
+    origin = f"{points[0][0]:.6f},{points[0][1]:.6f}"
+    if len(points) == 1:
+        return f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(origin)}&travelmode=driving"
+    destination = f"{points[-1][0]:.6f},{points[-1][1]:.6f}"
+    waypoints = [f"{lat:.6f},{lon:.6f}" for lat, lon in points[1:-1]]
+    url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(origin)}&destination={urllib.parse.quote(destination)}&travelmode=driving"
+    if waypoints:
+        url += f"&waypoints={urllib.parse.quote('|'.join(waypoints))}"
+    return url
 
 # === safe_col для борьбы с дублями ===
 def safe_col(df, name):
@@ -422,23 +442,32 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
+    """
+    Строит массив jobs для ORS из Google Sheets.
+    Здесь НЕТ дополнительного умножения: объём в м³ -> scale_volume_m3_to_units (×1000),
+    вес в кг -> scale_weight_kg_to_units (×1). Всё. Больше нигде не масштабируем.
+
+    В логи выводим контрольную строку по каждой заявке: order_no, vol_m3 -> vol_units, kg -> kg_units.
+    """
     jobs = []
     row_index_by_job_id = {}
     coords_cache = {}
     job_info = {}
 
-    # убираем лишние хвосты типа "кв. 99" или "офис 12" для геокодинга
+    # геокодим аккуратнее: режем квартиры/офисы и прочие хвосты
     def clean_address_for_geocode(addr: str) -> str:
         if not addr:
             return ""
-        return re.sub(r"(кв\.?\s*\d+.*)|(офис\s*\d+.*)", "", addr, flags=re.IGNORECASE).strip()
+        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", addr, flags=re.IGNORECASE)
+        s = re.sub(r"\s{2,}", " ", s)
+        return s.strip(",; ").strip()
 
     for idx, row in enumerate(rows, start=start_row_idx):
         status = str(row.get("Статус", "")).strip().lower()
         driver_cell = str(row.get("Водитель", "")).strip()
         addr_raw = str(row.get("Адрес доставки", "")).strip()
 
-        # пропускаем пустые адреса и уже назначенные/закрытые заявки
+        # пропускаем пустые и уже отработанные
         if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
@@ -450,26 +479,38 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
         coords_cache[idx] = (float(lon), float(lat))
 
+        # сервис и окна
         service_min = DEFAULT_SERVICE_MIN
         if COL_SERVICE_MIN:
             service_min = int(to_float(row.get("Время сервиса (мин)"), DEFAULT_SERVICE_MIN))
-
         tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
 
-        vol_m3 = to_float(row.get("Объем заказа", 0))
-        wgt_kg = to_float(row.get("Вес заказа", 0))
+        # сырье из таблицы
+        vol_m3 = to_float(row.get("Объем заказа", 0.0))
+        wgt_kg = to_float(row.get("Вес заказа", 0.0))
+        if vol_m3 < 0: vol_m3 = 0.0
+        if wgt_kg < 0: wgt_kg = 0.0
 
-        vol_units = scale_volume_m3_to_units(vol_m3)
-        wgt_units = scale_weight_kg_to_units(wgt_kg)
+        # единицы для ORS (ровно ОДИН раз)
+        vol_units = scale_volume_m3_to_units(vol_m3)   # 1 м³ = 1000 units
+        wgt_units = scale_weight_kg_to_units(wgt_kg)   # 1 кг = 1 unit
+
+        # контрольный лог
+        try:
+            order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or "").strip()
+        except Exception:
+            order_no_dbg = ""
+        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol_m3={vol_m3} -> vol_units={vol_units}; "
+                     f"w_kg={wgt_kg} -> w_units={wgt_units}; addr='{addr_for_geo}' loc=[{lon},{lat}]")
 
         order_no = order_no_from_col_A(idx)
-        job_id = idx  # технический id для ORS
+        job_id = idx  # уникальность в рамках листа
 
         job = {
             "id": job_id,
             "location": [float(lon), float(lat)],
             "service": int(service_min * 60),
-            "amount": [vol_units, wgt_units],
+            "amount": [int(vol_units), int(wgt_units)],
             "description": str(order_no)
         }
         if tw:
@@ -478,8 +519,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         jobs.append(job)
         row_index_by_job_id[job_id] = idx
         job_info[job_id] = {
-            "addr": addr_raw,  # тут сохраняем полный адрес (с кв/офис)
-            "addr_geo": addr_for_geo,  # адрес для геокодинга
+            "addr": addr_raw,
+            "addr_geo": addr_for_geo,
             "order_no": order_no,
             "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
@@ -487,6 +528,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         }
 
     return jobs, row_index_by_job_id, coords_cache, job_info
+
 
 def build_vehicles_from_drivers():
     """
@@ -561,11 +603,27 @@ def reason_for_unassigned(job, vehicles):
     return ", ".join(reasons)
 
 def ors_optimize(jobs, vehicles):
+    """
+    Отправляет корректный JSON в ORS. Используем json=payload,
+    чтобы не словить «кривую» сериализацию и случайные мусорные куски.
+    """
     url = "https://api.openrouteservice.org/optimization"
-    headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
+    headers = {"Authorization": ORS_API_KEY}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
+
+    # компактный лог + полный для отладки
+    try:
+        sample = {
+            "jobs": [{k: j[k] for k in ("id", "location", "amount")} for j in jobs[:5]],
+            "vehicles": [{k: v[k] for k in ("id", "capacity")} for v in vehicles[:3]]
+        }
+        logger.debug("📤 ORS payload (sample): %s", json.dumps(sample, ensure_ascii=False))
+    except Exception:
+        pass
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
+
+    # важно: именно json=payload, не data=json.dumps(...)
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     return r.json()
 
@@ -608,15 +666,15 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка регистрации водителя: {e}")
         await update.message.reply_text("⚠️ Неверный формат. Пример: `2.5, 500, А123ВС78`", parse_mode="Markdown")
 
-def build_task_keyboard(lat: float, lon: float, row_index: int):
-    route_url = build_point_route_url(lat, lon)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{row_index}"),
-            InlineKeyboardButton("❌ Не выполнено", callback_data=f"fail:{row_index}")
-        ],
-        [InlineKeyboardButton("📍 Маршрут", url=route_url)]
-    ])
+def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
+    rows = [[
+        InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{row_index}"),
+        InlineKeyboardButton("❌ Не выполнено", callback_data=f"fail:{row_index}")
+    ]]
+    if lat is not None and lon is not None:
+        route_url = build_point_route_url(lat, lon)
+        rows.append([InlineKeyboardButton("📍 Маршрут", url=route_url)])
+    return InlineKeyboardMarkup(rows)
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot):
