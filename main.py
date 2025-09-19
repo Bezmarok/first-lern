@@ -156,32 +156,55 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * asin(sqrt(a))
 
 def scale_volume_m3_to_units(vol_m3: float) -> int:
-    try: v = float(vol_m3)
-    except Exception: v = 0.0
-    return max(0, int(round(v * VOLUME_SCALE)))
+    """
+    Конвертируем м³ в дм³ (литры), чтобы не терять дробные значения.
+    1 м³ = 1000 units.
+    """
+    try:
+        v = float(vol_m3)
+    except Exception:
+        v = 0.0
+    return max(0, int(round(v * 1000)))
+
 
 def scale_weight_kg_to_units(w_kg: float) -> int:
-    try: w = float(w_kg)
-    except Exception: w = 0.0
-    return max(0, int(round(w * WEIGHT_SCALE)))
+    """
+    Конвертируем кг в десятки кг.
+    10 кг = 1 unit.
+    """
+    try:
+        w = float(w_kg)
+    except Exception:
+        w = 0.0
+    return max(0, int(round(w / 10)))
+
 
 def geocode_address(address: str):
     """
     Геокодирование адреса через ORS Pelias.
-    Возвращает (lon, lat) или (None, None), если не нашли.
+    Возвращает (lon, lat) или (None, None).
     """
     try:
         url = "https://api.openrouteservice.org/geocode/search"
-        params = {"api_key": ORS_API_KEY, "text": address, "size": 1, "lang": "ru"}
+        # если адрес начинается с индекса — убираем
+        addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
+        params = {
+            "api_key": ORS_API_KEY,
+            "text": addr,
+            "size": 1,
+            "lang": "ru",
+            "boundary.country": "RU",
+            "focus.point.lon": WAREHOUSE_LON,
+            "focus.point.lat": WAREHOUSE_LAT
+        }
         r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         data = r.json()
         feats = data.get("features", [])
         if feats:
             coords = feats[0]["geometry"]["coordinates"]  # [lon, lat]
-            lon, lat = float(coords[0]), float(coords[1])
-            return lon, lat
-        logger.warning(f"Геокодер ORS не нашёл координаты: {address}")
+            return float(coords[0]), float(coords[1])
+        logger.warning(f"Геокодер ORS не нашёл координаты: {addr}")
     except Exception as e:
         logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
     return (None, None)
