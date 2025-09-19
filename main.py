@@ -473,23 +473,50 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
     return jobs, row_index_by_job_id, coords_cache, job_info
 
 def build_vehicles_from_drivers():
+    """
+    Собирает список машин для ORS. 
+    Возвращает список словарей с id, профилем, старт/финиш, окном доступности и грузоподъёмностью.
+    """
     vehicles = []
-    s_lat = float(WAREHOUSE_LAT); s_lon = float(WAREHOUSE_LON)
+    try:
+        s_lat = float(WAREHOUSE_LAT)
+        s_lon = float(WAREHOUSE_LON)
+    except Exception:
+        logger.error("⚠️ Неверные координаты склада. Проверь WAREHOUSE_LAT/LON.")
+        return vehicles
+
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
     end = today + timedelta(days=3, hours=23, minutes=59)
+
     for user_id, drv in drivers_data.items():
-        vol_cap_m3 = float(drv["volume"])
-        wgt_cap_kg = float(drv["weight"])
-        vehicles.append({
+        try:
+            vol_cap_m3 = float(drv["volume"])
+            wgt_cap_kg = float(drv["weight"])
+        except Exception as e:
+            logger.warning(f"⚠️ У водителя {user_id} некорректные параметры: {e}")
+            continue
+
+        vehicle = {
             "id": int(user_id),
             "profile": "driving-car",
-            "start": [float(s_lon), float(s_lat)],
-            "end":   [float(s_lon), float(s_lat)],
+            "start": [s_lon, s_lat],
+            "end": [s_lon, s_lat],
             "time_window": [to_unix(start), to_unix(end)],
-            "capacity": [scale_volume_m3_to_units(vol_cap_m3), scale_weight_kg_to_units(wgt_cap_kg)],
-            "description": drv["username"]
-        })
+            "capacity": [
+                scale_volume_m3_to_units(vol_cap_m3),
+                scale_weight_kg_to_units(wgt_cap_kg)
+            ],
+            "description": drv.get("username", f"id_{user_id}")
+        }
+        vehicles.append(vehicle)
+
+    # sanity check
+    for v in vehicles:
+        if not isinstance(v, dict) or "id" not in v:
+            logger.error(f"🚨 В vehicles затесался мусор: {v}")
+            raise ValueError("Сломанный объект в списке машин.")
+
     return vehicles
 
 def reason_for_unassigned(job, vehicles):
