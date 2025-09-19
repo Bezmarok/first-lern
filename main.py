@@ -156,22 +156,16 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * asin(sqrt(a))
 
 def scale_volume_m3_to_units(vol_m3: float) -> int:
-    """
-    В Excel объём уже в м³. ORS требует целые значения.
-    Оставляем м³ как есть, но умножаем на 100, чтобы сохранить дроби.
-    Пример: 0.4148 м³ -> 41 units, 29.7 м³ -> 2970 units.
-    """
+    """Переводим м³ в литры. 1 м³ = 1000 units."""
     try:
         v = float(vol_m3)
     except Exception:
         v = 0.0
-    return max(0, int(round(v * 100)))
+    return max(0, int(round(v * 1000)))
 
 
 def scale_weight_kg_to_units(w_kg: float) -> int:
-    """
-    Вес в кг. Чтобы не перегружать ORS, считаем 1 unit = 1 кг.
-    """
+    """Вес в кг. 1 кг = 1 unit."""
     try:
         w = float(w_kg)
     except Exception:
