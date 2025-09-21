@@ -51,8 +51,8 @@ DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
 
 # ⚖️ Масштабирование единиц
 # Теперь считаем объём прямо в м³, а вес прямо в кг
-VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1000"))
-WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1000"))
+VOLUME_SCALE = int(os.environ.get("VOLUME_SCALE", "1"))
+WEIGHT_SCALE = int(os.environ.get("WEIGHT_SCALE", "1"))
 
 drivers_data = {}
 assigned_requests = defaultdict(list)
@@ -176,15 +176,15 @@ def geocode_address(address: str):
     """
     Геокодирование адреса через ORS Pelias.
     Возвращает (lon, lat) или (None, None).
+    Оставляем только координаты в пределах СПб.
     """
     try:
         url = "https://api.openrouteservice.org/geocode/search"
-        # если адрес начинается с индекса — убираем
         addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
         params = {
             "api_key": ORS_API_KEY,
             "text": addr,
-            "size": 1,
+            "size": 5,
             "lang": "ru",
             "boundary.country": "RU",
             "focus.point.lon": WAREHOUSE_LON,
@@ -194,14 +194,15 @@ def geocode_address(address: str):
         r.raise_for_status()
         data = r.json()
         feats = data.get("features", [])
-        if feats:
-            coords = feats[0]["geometry"]["coordinates"]  # [lon, lat]
-            return float(coords[0]), float(coords[1])
-        logger.warning(f"Геокодер ORS не нашёл координаты: {addr}")
+        for f in feats:
+            lon, lat = f["geometry"]["coordinates"]
+            # фильтр для Питера
+            if 29 < lon < 31 and 59 < lat < 61:
+                return float(lon), float(lat)
+        logger.warning(f"Не нашёл питерских координат для: {addr}")
     except Exception as e:
         logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
     return (None, None)
-import urllib.parse
 
 def build_point_route_url(lat: float | None, lon: float | None) -> str:
     if lat is None or lon is None:
@@ -911,5 +912,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.run_polling()
-
 
