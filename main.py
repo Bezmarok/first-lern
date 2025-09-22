@@ -155,29 +155,7 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
-def scale_volume_m3_to_units(vol_m3: float) -> int:
-    """Переводим м³ в литры. 1 м³ = 1000 units."""
-    try:
-        v = float(vol_m3)
-    except Exception:
-        v = 0.0
-    return max(0, int(round(v * 1000)))
-
-
-def scale_weight_kg_to_units(w_kg: float) -> int:
-    """Вес в кг. 1 кг = 1 unit."""
-    try:
-        w = float(w_kg)
-    except Exception:
-        w = 0.0
-    return max(0, int(round(w)))
-
 def geocode_address(address: str):
-    """
-    Геокодирование адреса через ORS Pelias.
-    Возвращает (lon, lat) или (None, None).
-    Оставляем только координаты в пределах СПб.
-    """
     try:
         url = "https://api.openrouteservice.org/geocode/search"
         addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
@@ -194,15 +172,22 @@ def geocode_address(address: str):
         r.raise_for_status()
         data = r.json()
         feats = data.get("features", [])
+        if not feats:
+            return (None, None)
+
+        # выбираем ближайший к складу результат
+        best = None
+        best_dist = 999999
         for f in feats:
             lon, lat = f["geometry"]["coordinates"]
-            # фильтр для Питера
-            if 29 < lon < 31 and 59 < lat < 61:
-                return float(lon), float(lat)
-        logger.warning(f"Не нашёл питерских координат для: {addr}")
+            dist = _haversine_km(float(WAREHOUSE_LAT), float(WAREHOUSE_LON), lat, lon)
+            if dist < best_dist:
+                best_dist = dist
+                best = (float(lon), float(lat))
+        return best if best else (None, None)
     except Exception as e:
         logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
-    return (None, None)
+        return (None, None)
 
 def build_point_route_url(lat: float | None, lon: float | None) -> str:
     if lat is None or lon is None:
@@ -445,17 +430,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_jobs_from_sheet(rows, start_row_idx=2):
     """
     Строит массив jobs для ORS из Google Sheets.
-    Здесь НЕТ дополнительного умножения: объём в м³ -> scale_volume_m3_to_units (×1000),
-    вес в кг -> scale_weight_kg_to_units (×1). Всё. Больше нигде не масштабируем.
-
-    В логи выводим контрольную строку по каждой заявке: order_no, vol_m3 -> vol_units, kg -> kg_units.
+    Теперь: объём передаём в м³ (float), вес в кг (float).
+    Без пересчёта в литры/units.
     """
     jobs = []
     row_index_by_job_id = {}
     coords_cache = {}
     job_info = {}
 
-    # геокодим аккуратнее: режем квартиры/офисы и прочие хвосты
     def clean_address_for_geocode(addr: str) -> str:
         if not addr:
             return ""
@@ -468,7 +450,6 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         driver_cell = str(row.get("Водитель", "")).strip()
         addr_raw = str(row.get("Адрес доставки", "")).strip()
 
-        # пропускаем пустые и уже отработанные
         if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
@@ -480,38 +461,30 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
         coords_cache[idx] = (float(lon), float(lat))
 
-        # сервис и окна
         service_min = DEFAULT_SERVICE_MIN
         if COL_SERVICE_MIN:
             service_min = int(to_float(row.get("Время сервиса (мин)"), DEFAULT_SERVICE_MIN))
         tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
 
-        # сырье из таблицы
-        vol_m3 = to_float(row.get("Объем заказа", 0.0))
-        wgt_kg = to_float(row.get("Вес заказа", 0.0))
-        if vol_m3 < 0: vol_m3 = 0.0
-        if wgt_kg < 0: wgt_kg = 0.0
-
-        # единицы для ORS (ровно ОДИН раз)
-        vol_units = scale_volume_m3_to_units(vol_m3)   # 1 м³ = 1000 units
-        wgt_units = scale_weight_kg_to_units(wgt_kg)   # 1 кг = 1 unit
+        # исходные значения прямо как есть
+        vol_m3 = max(0.0, to_float(row.get("Объем заказа", 0.0)))
+        wgt_kg = max(0.0, to_float(row.get("Вес заказа", 0.0)))
 
         # контрольный лог
         try:
             order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or "").strip()
         except Exception:
             order_no_dbg = ""
-        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol_m3={vol_m3} -> vol_units={vol_units}; "
-                     f"w_kg={wgt_kg} -> w_units={wgt_units}; addr='{addr_for_geo}' loc=[{lon},{lat}]")
+        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol={vol_m3:.3f} м³; w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
 
         order_no = order_no_from_col_A(idx)
-        job_id = idx  # уникальность в рамках листа
+        job_id = idx
 
         job = {
             "id": job_id,
             "location": [float(lon), float(lat)],
             "service": int(service_min * 60),
-            "amount": [int(vol_units), int(wgt_units)],
+            "amount": [vol_m3, wgt_kg],
             "description": str(order_no)
         }
         if tw:
@@ -533,8 +506,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 
 def build_vehicles_from_drivers():
     """
-    Собирает список машин для ORS. 
-    Возвращает список словарей с id, профилем, старт/финиш, окном доступности и грузоподъёмностью.
+    Собирает список машин для ORS.
+    Вместимость теперь в м³ и кг (те же единицы, что и у jobs).
     """
     vehicles = []
     try:
@@ -562,15 +535,11 @@ def build_vehicles_from_drivers():
             "start": [s_lon, s_lat],
             "end": [s_lon, s_lat],
             "time_window": [to_unix(start), to_unix(end)],
-            "capacity": [
-                scale_volume_m3_to_units(vol_cap_m3),
-                scale_weight_kg_to_units(wgt_cap_kg)
-            ],
+            "capacity": [vol_cap_m3, wgt_cap_kg],
             "description": drv.get("username", f"id_{user_id}")
         }
         vehicles.append(vehicle)
 
-    # sanity check
     for v in vehicles:
         if not isinstance(v, dict) or "id" not in v:
             logger.error(f"🚨 В vehicles затесался мусор: {v}")
