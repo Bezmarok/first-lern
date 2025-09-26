@@ -431,7 +431,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
     """
     Строит массив jobs для ORS из Google Sheets.
     Работает с результатом sheet.get_all_records(), где каждая строка — dict.
-    Объём в м³, вес в кг.
+    Объём в м³, вес в кг (округляем до 1 знака).
     """
     jobs = []
     row_index_by_job_id = {}
@@ -441,8 +441,21 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
     def clean_address_for_geocode(addr: str) -> str:
         if not addr:
             return ""
-        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", addr, flags=re.IGNORECASE)
+        s = str(addr)
+
+        # убираем почтовый индекс в начале
+        s = re.sub(r"^\s*\d{5,6},?\s*", "", s)
+
+        # убираем повторы "Россия, Санкт-Петербург"
+        s = s.replace("Россия, Санкт-Петербург, Санкт-Петербург", "Россия, Санкт-Петербург")
+
+        # убираем "кв.", "корп.", "лит.", "строение"
+        s = re.sub(r"(кв\.?\s*\S+)|(корп(ус)?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", s, flags=re.IGNORECASE)
+
+        # нормализуем пробелы и запятые
         s = re.sub(r"\s{2,}", " ", s)
+        s = re.sub(r",+", ",", s)
+
         return s.strip(",; ").strip()
 
     for idx, row in enumerate(rows, start=start_row_idx):
@@ -467,15 +480,14 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             service_min = int(to_float(row.get("Время сервиса (мин)"), DEFAULT_SERVICE_MIN))
         tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
 
-        vol_m3 = max(0.0, to_float(row.get("Объем заказа", 0.0)))
-        wgt_kg = max(0.0, to_float(row.get("Вес заказа", 0.0)))
+        # округляем объём и вес до 1 знака
+        vol_m3 = round(max(0.0, to_float(row.get("Объем заказа", 0.0))), 1)
+        wgt_kg = round(max(0.0, to_float(row.get("Вес заказа", 0.0))), 1)
 
         order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or idx).strip()
-        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol={vol_m3:.3f} м³; w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
+        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol={vol_m3:.1f} м³; w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
 
-        # используем индекс строки в качестве id
         job_id = idx
-
         job = {
             "id": job_id,
             "location": [float(lon), float(lat)],
