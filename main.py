@@ -430,70 +430,140 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_jobs_from_sheet(rows, start_row_idx=2):
     """
     Строит массив jobs для ORS из Google Sheets.
-    Работает с результатом sheet.get_all_records(), где каждая строка — dict.
-    Объём в м³, вес в кг (округляем до 1 знака).
+    Объём — м³ (float, округление до 2 знаков), вес — кг (float, до 1 знака).
+    Возвращает: jobs, row_index_by_job_id, coords_cache, job_info
     """
-    jobs = []
-    row_index_by_job_id = {}
-    coords_cache = {}
-    job_info = {}
+    def norm_key(s: str) -> str:
+        return re.sub(r"\s+", "", str(s).lower().replace("ё", "е"))
+
+    # Алиасы, чтобы не промахнуться по заголовкам
+    aliases = {
+        "status":  ["статус"],
+        "driver":  ["водитель"],
+        "address": ["адресдоставки", "адрес"],
+        "order":   ["номерзаявки", "номер", "id", "заявка"],
+        "plan_dt": ["планвремядата", "доставкa", "дата", "время"],
+        "volume":  ["обьемзаказа", "объемзаказа", "обьем", "объем", "volume", "объемм3", "обьемм3", "м3", "м^3"],
+        "weight":  ["весзаказа", "вес", "масса"],
+        "qty":     ["количествотовара", "количество"]
+    }
+
+    # Предпостроим отображение нормализованных ключей строки -> исходный ключ
+    def pick_key(row: dict, keys: list[str]) -> str | None:
+        nk = {norm_key(k): k for k in row.keys()}
+        for wanted in keys:
+            for nkc, orig in nk.items():
+                if wanted in nkc:
+                    return orig
+        return None
+
+    def as_float(val, default=0.0):
+        if val is None:
+            return float(default)
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        # убираем лишние символы
+        s = s.replace(" ", "").replace("\u00a0", "")
+        s = s.replace(",", ".")
+        # отбрасываем всё, что после второго числа
+        m = re.match(r"^-?\d+(\.\d+)?", s)
+        try:
+            return float(m.group(0)) if m else float(default)
+        except Exception:
+            return float(default)
 
     def clean_address_for_geocode(addr: str) -> str:
         if not addr:
             return ""
         s = str(addr)
+        # срезаем индекс в начале
+        s = re.sub(r"^\s*\d{5,6}\s*,\s*", "", s)
+        # убираем повторы города типа "Санкт-Петербург, Санкт-Петербург"
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        seen = []
+        for p in parts:
+            if not seen or norm_key(p) != norm_key(seen[-1]):
+                seen.append(p)
+        s = ", ".join(seen)
 
-        # убираем почтовый индекс в начале
-        s = re.sub(r"^\s*\d{5,6},?\s*", "", s)
+        # удаляем кв/офис/пом/лит/строение — для геокода только улица и дом
+        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s{2,}", " ", s).strip(",; ").strip()
+        return s
 
-        # убираем повторы "Россия, Санкт-Петербург"
-        s = s.replace("Россия, Санкт-Петербург, Санкт-Петербург", "Россия, Санкт-Петербург")
-
-        # убираем "кв.", "корп.", "лит.", "строение"
-        s = re.sub(r"(кв\.?\s*\S+)|(корп(ус)?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", s, flags=re.IGNORECASE)
-
-        # нормализуем пробелы и запятые
-        s = re.sub(r"\s{2,}", " ", s)
-        s = re.sub(r",+", ",", s)
-
-        return s.strip(",; ").strip()
+    jobs = []
+    row_index_by_job_id = {}
+    coords_cache = {}
+    job_info = {}
 
     for idx, row in enumerate(rows, start=start_row_idx):
-        status = str(row.get("Статус", "")).strip().lower()
-        driver_cell = str(row.get("Водитель", "")).strip()
-        addr_raw = str(row.get("Адрес доставки", "")).strip()
+        if not row or not isinstance(row, dict):
+            continue
 
-        # пропускаем уже выполненные/назначенные
+        # Подхватываем реальные ключи из строки
+        k_status  = pick_key(row, aliases["status"])
+        k_driver  = pick_key(row, aliases["driver"])
+        k_addr    = pick_key(row, aliases["address"])
+        k_order   = pick_key(row, aliases["order"])
+        k_plan    = pick_key(row, aliases["plan_dt"])
+        k_vol     = pick_key(row, aliases["volume"])
+        k_wgt     = pick_key(row, aliases["weight"])
+        # qty нам не нужен для расчётов, но пригодится для отладки
+        k_qty     = pick_key(row, aliases["qty"])
+
+        status = str(row.get(k_status, "")).strip().lower() if k_status else ""
+        driver_cell = str(row.get(k_driver, "")).strip() if k_driver else ""
+        addr_raw = str(row.get(k_addr, "")).strip() if k_addr else ""
+
+        # Пропускаем уже назначенные/выполненные/без адреса
         if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
         addr_for_geo = clean_address_for_geocode(addr_raw)
         lon, lat = geocode_address(addr_for_geo)
         if not (lon and lat):
-            logger.warning(f"Пропущена заявка (строка {idx}) — не удалось геокодить: {addr_for_geo}")
+            logger.warning(f"Пропущена заявка {idx} — не удалось геокодить: {addr_for_geo}")
             continue
 
         coords_cache[idx] = (float(lon), float(lat))
 
-        service_min = DEFAULT_SERVICE_MIN
-        if COL_SERVICE_MIN:
-            service_min = int(to_float(row.get("Время сервиса (мин)"), DEFAULT_SERVICE_MIN))
-        tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
+        # Время окна
+        tw = parse_time_window(row.get(k_plan)) if k_plan else None
 
-        # округляем объём и вес до 1 знака
-        vol_m3 = round(max(0.0, to_float(row.get("Объем заказа", 0.0))), 1)
-        wgt_kg = round(max(0.0, to_float(row.get("Вес заказа", 0.0))), 1)
+        # Сырые значения
+        raw_vol = row.get(k_vol) if k_vol else None
+        raw_wgt = row.get(k_wgt) if k_wgt else None
+        raw_qty = row.get(k_qty) if k_qty else None
 
-        order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or idx).strip()
-        logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol={vol_m3:.1f} м³; w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
+        # Нормализация чисел
+        vol_m3 = round(max(0.0, as_float(raw_vol, 0.0)), 2)
+        wgt_kg = round(max(0.0, as_float(raw_wgt, 0.0)), 1)
+
+        # Защитные ходы против типичных косяков:
+        # 1) Если «объём» вдруг равен целому и при этом совпадает с «кол-вом товара» — это почти наверняка подмена столбца.
+        try:
+            qty_val = as_float(raw_qty, None) if raw_qty is not None else None
+            if qty_val is not None and abs(vol_m3 - qty_val) < 1e-9 and vol_m3 > 0 and as_float(raw_vol, None) is None:
+                logger.warning(f"[ROW {idx}] Похоже, подхватили 'Количество товара' вместо 'Объем заказа' -> vol={vol_m3}, qty={qty_val}. Ставлю vol=0.00")
+                vol_m3 = 0.00
+        except Exception:
+            pass
+
+        # id и номер заявки
+        try:
+            order_no_raw = str(row.get(k_order, "")).strip() if k_order else ""
+        except Exception:
+            order_no_raw = ""
+        order_no = order_no_raw if order_no_raw else order_no_from_col_A(idx)
 
         job_id = idx
         job = {
             "id": job_id,
             "location": [float(lon), float(lat)],
-            "service": int(service_min * 60),
+            "service": int(DEFAULT_SERVICE_MIN * 60),
             "amount": [vol_m3, wgt_kg],
-            "description": order_no_dbg
+            "description": str(order_no),
         }
         if tw:
             job["time_windows"] = [tw]
@@ -503,11 +573,14 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         job_info[job_id] = {
             "addr": addr_raw,
             "addr_geo": addr_for_geo,
-            "order_no": order_no_dbg,
+            "order_no": order_no,
             "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
-            "tw": job.get("time_windows", None)
+            "tw": job.get("time_windows"),
+            "raw": {"vol": raw_vol, "wgt": raw_wgt, "qty": raw_qty}
         }
+
+        logger.debug(f"[JOB row {idx}] order='{order_no}' raw_vol='{raw_vol}' -> vol={vol_m3:.2f} м³; raw_wgt='{raw_wgt}' -> w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
