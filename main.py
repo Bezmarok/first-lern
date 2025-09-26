@@ -430,8 +430,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_jobs_from_sheet(rows, start_row_idx=2):
     """
     Строит массив jobs для ORS из Google Sheets.
-    Теперь: объём передаём в м³ (float), вес в кг (float).
-    Без пересчёта в литры/units.
+    Работает с результатом sheet.get_all_records(), где каждая строка — dict.
+    Объём в м³, вес в кг.
     """
     jobs = []
     row_index_by_job_id = {}
@@ -450,13 +450,14 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         driver_cell = str(row.get("Водитель", "")).strip()
         addr_raw = str(row.get("Адрес доставки", "")).strip()
 
+        # пропускаем уже выполненные/назначенные
         if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
         addr_for_geo = clean_address_for_geocode(addr_raw)
         lon, lat = geocode_address(addr_for_geo)
         if not (lon and lat):
-            logger.warning(f"Пропущена заявка {idx} — не удалось геокодить: {addr_for_geo}")
+            logger.warning(f"Пропущена заявка (строка {idx}) — не удалось геокодить: {addr_for_geo}")
             continue
 
         coords_cache[idx] = (float(lon), float(lat))
@@ -466,18 +467,13 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             service_min = int(to_float(row.get("Время сервиса (мин)"), DEFAULT_SERVICE_MIN))
         tw = parse_time_window(row.get("План время дата")) if COL_PLAN_DT else None
 
-        # исходные значения прямо как есть
         vol_m3 = max(0.0, to_float(row.get("Объем заказа", 0.0)))
         wgt_kg = max(0.0, to_float(row.get("Вес заказа", 0.0)))
 
-        # контрольный лог
-        try:
-            order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or "").strip()
-        except Exception:
-            order_no_dbg = ""
+        order_no_dbg = str(row.get("номер заявки") or row.get("Номер заявки") or idx).strip()
         logger.debug(f"[JOB row {idx}] order='{order_no_dbg}' vol={vol_m3:.3f} м³; w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
 
-        order_no = order_no_from_col_A(idx)
+        # используем индекс строки в качестве id
         job_id = idx
 
         job = {
@@ -485,7 +481,7 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             "location": [float(lon), float(lat)],
             "service": int(service_min * 60),
             "amount": [vol_m3, wgt_kg],
-            "description": str(order_no)
+            "description": order_no_dbg
         }
         if tw:
             job["time_windows"] = [tw]
@@ -495,14 +491,13 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         job_info[job_id] = {
             "addr": addr_raw,
             "addr_geo": addr_for_geo,
-            "order_no": order_no,
+            "order_no": order_no_dbg,
             "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
             "tw": job.get("time_windows", None)
         }
 
     return jobs, row_index_by_job_id, coords_cache, job_info
-
 
 def build_vehicles_from_drivers():
     """
@@ -648,7 +643,13 @@ def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot):
+    """
+    Основная функция: строит задачи из Google Sheets (dict-строки),
+    оптимизирует маршруты через ORS и распределяет заявки.
+    Работает полностью через get_all_records().
+    """
     rows = sheet.get_all_records()
+
     if not drivers_data:
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет данных от водителей.")
         return
@@ -664,7 +665,10 @@ async def optimize_and_assign(bot):
         return
 
     if len(jobs) > 50 or len(vehicles) > 3:
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3).")
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3)."
+        )
         return
 
     try:
@@ -677,137 +681,85 @@ async def optimize_and_assign(bot):
     unassigned_raw = solution.get("unassigned", [])
     unassigned_ids = extract_unassigned_ids(unassigned_raw)
 
+    # --- сообщение админу про нераспределённые заявки ---
     if unassigned_ids:
         job_by_id = {j["id"]: j for j in jobs}
         lines = []
         for jid in unassigned_ids:
             idx = row_index_by_job_id.get(jid)
-            order_no = order_no_from_col_A(idx) if idx else str(jid)
+            order_no = job_info.get(jid, {}).get("order_no", str(jid))
             reason = reason_for_unassigned(job_by_id.get(jid, {}), vehicles)
             lines.append(f"• №{order_no} — {reason}")
         msg = "⚠️ Нераспределены заявки:\n" + "\n".join(lines) + \
               "\n\nДобавьте машины или перенесите нераспределённые заявки на другой день."
         await bot.send_message(chat_id=ADMIN_ID, text=msg)
 
+    # --- формируем маршруты по машинам ---
     routes_by_vehicle = {}
     for r in routes:
         vid = int(r["vehicle"])
         steps = [s for s in r.get("steps", []) if s.get("type") == "job"]
-        route_dist_km = 0.0
-        if "distance" in r:
-            try:
-                route_dist_km = float(r["distance"]) / 1000.0
-            except Exception:
-                route_dist_km = 0.0
+        route_dist_km = float(r.get("distance", 0)) / 1000.0
         routes_by_vehicle[vid] = {"steps": steps, "route_km": route_dist_km}
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
-    for vid, data in routes_by_vehicle.items():
-        drv = drivers_data.get(vid)
-        username = drv["username"] if drv else f"id_{vid}"
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📦 Машина {vid} ({username}): задач {len(data['steps'])}, пробег ~{data['route_km']:.1f} км"
-        )
-
-    prev_leg_km_by_row.clear()
-
+    # --- обновление статусов в таблице (пакетно) ---
+    updates = []
     for vid, data in routes_by_vehicle.items():
         drv = drivers_data.get(vid)
         driver_username = drv["username"] if drv else f"id_{vid}"
-        job_steps = data["steps"]
 
-        waypoints_latlon = []
-        total_vol_m3 = 0.0
-        total_wgt_kg = 0.0
-        lines = []
-        per_stop_msgs = []
-
-        try:
-            prev_lat = float(WAREHOUSE_LAT)
-            prev_lon = float(WAREHOUSE_LON)
-        except Exception:
-            prev_lat = prev_lon = None
-
-        route_km_computed = 0.0
-
-        for s in job_steps:
+        for s in data["steps"]:
             job_id = int(s["job"])
-            row_idx = row_index_by_job_id.get(job_id)
+            row_idx = row_index_by_job_id.get(job_id)   # индекс строки из get_all_records() + 2 (заголовки)
             if not row_idx:
                 continue
+            # Excel-нумерация: реальная строка = row_idx (так как start=2 в build_jobs_from_sheet)
+            sheet_row = row_idx
 
-            info = job_info[job_id]
-            addr = info["addr"]
-            order_no = info["order_no"]
-            vol_m3 = info["vol_m3"]; wgt_kg = info["wgt_kg"]
-            total_vol_m3 += vol_m3; total_wgt_kg += wgt_kg
+            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
 
-            arrival = s.get("arrival")
-            eta_str = datetime.fromtimestamp(arrival).strftime("%H:%M") if arrival else ""
+            # готовим обновления
+            if COL_STATUS:   updates.append((sheet_row, COL_STATUS, "выполняется"))
+            if COL_DRIVER:   updates.append((sheet_row, COL_DRIVER, driver_username))
+            if COL_UPDATED:  updates.append((sheet_row, COL_UPDATED, now_human()))
+            if COL_ETA and eta_str: updates.append((sheet_row, COL_ETA, eta_str))
+            if COL_CAR_PLATE and drv: updates.append((sheet_row, COL_CAR_PLATE, drv.get("car_plate", "")))
 
-            lon, lat = coords_cache.get(row_idx, (None, None))
-            if lon and lat:
-                waypoints_latlon.append((float(lat), float(lon)))
-                seg_km = 0.0
-                if prev_lat is not None and prev_lon is not None:
-                    seg_km = _haversine_km(prev_lat, prev_lon, float(lat), float(lon))
-                    route_km_computed += seg_km
-                prev_lat, prev_lon = float(lat), float(lon)
-                prev_leg_km_by_row[row_idx] = seg_km
-
-            if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, "выполняется")
-            if COL_DRIVER:  sheet.update_cell(row_idx, COL_DRIVER, driver_username)
-            if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
-            if COL_ETA and arrival: sheet.update_cell(row_idx, COL_ETA, eta_str)
-            if COL_CAR_PLATE and drv: sheet.update_cell(row_idx, COL_CAR_PLATE, drv.get("car_plate", ""))
-
-            lines.append(f"• №{order_no} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
-
-            row_dict = rows[row_idx - 2]
-            plan_dt   = row_dict.get("План время дата", "")
-            item_name = row_dict.get("наименование", "") or row_dict.get("Наименование", "")
-            item_qty  = row_dict.get("Количество товара", "")
-            phone     = row_dict.get("Телефон", "")
-            point_text = (
-                f"📦 Заявка №{order_no}\n"
-                f"📍 Адрес: {addr}\n"
-                f"🗓 Время: {plan_dt}\n"
-                f"⏱ ETA: {eta_str}\n"
-                f"📦 Товары: {item_name} x {item_qty}\n"
-                f"📞 Тел: {phone}\n"
-                f"🚘 Госномер: {drv.get('car_plate', '') if drv else ''}"
-            )
-            per_stop_msgs.append((point_text, float(lat) if lat else None, float(lon) if lon else None, row_idx))
-
+    # выполняем обновления пачкой
+    for row, col_idx, value in updates:
         try:
-            s_lat = float(WAREHOUSE_LAT); s_lon = float(WAREHOUSE_LON)
-            full_latlon = [(s_lat, s_lon)] + waypoints_latlon if waypoints_latlon else [(s_lat, s_lon)]
-        except Exception:
-            full_latlon = waypoints_latlon[:]
+            sheet.update_cell(row, col_idx, value)
+        except Exception as e:
+            logger.error(f"Не удалось обновить ячейку ({row},{col_idx}): {e}")
 
-        route_text = "🧭 Оптимальный маршрут на сегодня:\n"
-        route_text += ("\n".join(lines) if lines else "На сегодня заявок нет")
+    # --- отправляем маршруты водителям ---
+    for vid, data in routes_by_vehicle.items():
+        drv = drivers_data.get(vid)
+        username = drv["username"] if drv else f"id_{vid}"
+        job_steps = data["steps"]
+
+        total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
+        total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
+
+        lines = []
+        for s in job_steps:
+            jid = int(s["job"])
+            info = job_info.get(jid, {})
+            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+            lines.append(f"• №{info.get('order_no', jid)} — {info.get('addr', '')}" + (f" (ETA {eta_str})" if eta_str else ""))
+
+        route_text = f"🧭 Оптимальный маршрут на сегодня:\n" + ("\n".join(lines) if lines else "Заявок нет")
         if lines:
-            route_text += f"\n\nИтого погрузка: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг"
-
-        route_total_km = data["route_km"] if data["route_km"] > 0 else route_km_computed
-        route_text += f"\n🛣 Пробег маршрута: ~{route_total_km:.1f} км"
-        route_text += f"\n📍 Открыть маршрут: {build_google_maps_multistop(full_latlon)}"
+            route_text += f"\n\nИтого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг"
+        route_text += f"\n🛣 Пробег маршрута: ~{data['route_km']:.1f} км"
 
         try:
             await bot.send_message(chat_id=vid, text=route_text)
         except Exception as e:
             logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить {driver_username} (id={vid}).")
-
-        for pt_text, lat, lon, row_idx in per_stop_msgs:
-            try:
-                await bot.send_message(chat_id=vid, text=pt_text,
-                                       reply_markup=build_task_keyboard(lat, lon, row_idx))
-            except Exception as e:
-                logger.error(f"Не удалось отправить карточку точки {row_idx} водителю {vid}: {e}")
+            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить {username} (id={vid}).")
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("♻️ Распределить повторно", callback_data="optimize_again")]])
     await bot.send_message(
@@ -815,6 +767,7 @@ async def optimize_and_assign(bot):
         text=f"✅ Готово. Маршрутов: {len(routes)}. Нераспределены: {len(unassigned_ids)}.",
         reply_markup=kb
     )
+
 # === КНОПКИ ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
