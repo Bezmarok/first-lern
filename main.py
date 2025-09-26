@@ -258,8 +258,72 @@ def _make_headers_from_row(row_list: list[str]) -> pd.Index:
     return pd.Index(unique)
 
 def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Читает один лист Excel и готовит данные для загрузки в Google Sheets бота.
+    Делает:
+      • Поиск строки заголовков
+      • Нормализацию чисел (запятая/точка, пробелы)
+      • Округление: Объем -> 2 знака, Вес -> 1 знак
+      • Чистку адреса (индекс/кв./офис/лит./строение/дубли города)
+      • Группировку по "номер заявки"
+    Возвращает DataFrame с колонками:
+      ["номер заявки","Вес заказа","Вид перевозки","Телефон","Объем заказа",
+       "Адрес доставки","Количество товара","наименование","План время дата"]
+    """
     if df_raw.empty:
         return pd.DataFrame()
+
+    # --- локальные утилиты ---
+    def parse_num(val, default=0.0) -> float:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return float(default)
+        if isinstance(val, (int, float)):
+            try:
+                return float(val)
+            except Exception:
+                return float(default)
+        s = str(val).strip()
+        s = s.replace("\u00a0", "").replace(" ", "")
+        s = s.replace(",", ".")
+        m = re.match(r"^-?\d+(\.\d+)?", s)
+        try:
+            return float(m.group(0)) if m else float(default)
+        except Exception:
+            return float(default)
+
+    def clean_addr(addr: str) -> str:
+        if not addr:
+            return ""
+        s = str(addr)
+
+        # вырезаем индекс в начале
+        s = re.sub(r"^\s*\d{5,6}\s*,\s*", "", s)
+
+        # раздутая конструкция "Россия, Санкт-Петербург, Санкт-Петербург" -> один раз
+        s = s.replace("Россия, Санкт-Петербург, Санкт-Петербург", "Россия, Санкт-Петербург")
+
+        # убираем квартиры/офисы/помещения/литеры/строения
+        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)",
+                   "", s, flags=re.IGNORECASE)
+
+        # убираем повторяющиеся сегменты типа "Санкт-Петербург, Санкт-Петербург"
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        dedup = []
+        for p in parts:
+            if not dedup or p.lower() != dedup[-1].lower():
+                dedup.append(p)
+
+        s = ", ".join(dedup)
+        s = re.sub(r"\s{2,}", " ", s)
+        s = re.sub(r",+", ",", s)
+        return s.strip(",; ").strip()
+
+    def norm_text(x) -> str:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return ""
+        return re.sub(r"[\r\n\t]+", " ", str(x)).strip()
+
+    # --- определяем шапку и режем пустоту ---
     hdr = detect_header_row(df_raw)
     header_row = df_raw.iloc[hdr].tolist()
     headers = _make_headers_from_row(header_row)
@@ -267,33 +331,28 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     df.columns = headers
 
     logger.debug(f"Найдены заголовки: {list(df.columns)}")
-    if "Номер заявки" in df.columns:
-        sample_col = safe_col(df, "Номер заявки")
-        logger.debug(f"Примеры номеров заявок (raw): {sample_col.astype(str).head(5).tolist()}")
 
     # удаляем полностью пустые колонки
     df = df.loc[:, ~df.apply(lambda col: col.astype(str).str.strip().isin(["", "nan", "None"]).all())]
+    # тянем значения сверху (часто шапка/дата растянута)
     df = df.ffill()
 
+    # --- гибкий поиск колонок-источников ---
     src_cols = {
-        "order":  ["Номер заявки"],
-        "date":   ["Дата доставки"],
-        "time":   ["Время доставки"],
-        "items":  ["Список товаров"],
-        "qty":    ["Кол-во товара"],
-        "volume": ["Объем заказа"],
-        "weight": ["Вес заказа"],
-        "addr":   ["Адрес доставки"],
-        "phone":  ["Телефон клиента"],
+        "order":  ["Номер заявки", "номер заявки", "Номер", "ID", "Заявка"],
+        "date":   ["Дата доставки", "Дата"],
+        "time":   ["Время доставки", "Время"],
+        "items":  ["Список товаров", "наименование", "Наименование"],
+        "qty":    ["Кол-во товара", "Количество товара", "Количество"],
+        "volume": ["Объем заказа", "Обьем заказа", "Объем", "Обьем", "м3", "М3"],
+        "weight": ["Вес заказа", "Вес"],
+        "addr":   ["Адрес доставки", "Адрес"],
+        "phone":  ["Телефон клиента", "Телефон"],
     }
 
     def pick(names):
-        for col in df.columns:
-            col_norm = str(col).strip().lower()
-            for target in names:
-                if target.lower() in col_norm:
-                    return col
-        return None
+        cand = [c for c in df.columns if any(n.lower() in str(c).strip().lower() for n in names)]
+        return cand[0] if cand else None
 
     c_order  = pick(src_cols["order"])
     c_date   = pick(src_cols["date"])
@@ -305,7 +364,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_addr   = pick(src_cols["addr"])
     c_phone  = pick(src_cols["phone"])
 
-    # порядок колонок под Google Sheets
+    # --- целевая форма под Google Sheets ---
     target_cols = [
         "номер заявки",        # A
         "Вес заказа",          # B
@@ -319,46 +378,63 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     ]
     out = pd.DataFrame(columns=target_cols)
 
+    # --- заполняем поля, сразу чистим и округляем ---
     def clean_order(v) -> str:
         s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
         s = re.sub(r"[гГ\-]", "", s)
         return re.sub(r"[^0-9A-Za-z]", "", s)
 
-    if c_order:
-        out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order)
-        logger.debug(f"Примеры номеров заявок (clean): {out['номер заявки'].head(5).tolist()}")
+    # номер заявки
+    out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
+
+    # вес: парсим и округляем до 1 знака (на уровне источника)
+    if c_weight:
+        w_series = safe_col(df, c_weight).apply(lambda x: round(parse_num(x, 0.0), 1))
     else:
-        out["номер заявки"] = ""
+        w_series = pd.Series([0.0] * len(df))
+    out["Вес заказа"] = w_series
 
-    out["Вес заказа"]        = safe_col(df, c_weight) if c_weight else ""
-    out["Вид перевозки"]     = ""  # в файле нет, оставляем пустым
-    out["Телефон"]           = safe_col(df, c_phone) if c_phone else ""
-    out["Объем заказа"]      = safe_col(df, c_volume) if c_volume else ""
-    out["Адрес доставки"]    = safe_col(df, c_addr)  if c_addr   else ""
-    out["Количество товара"] = safe_col(df, c_qty)   if c_qty    else ""
-    out["наименование"]      = safe_col(df, c_items) if c_items  else ""
+    out["Вид перевозки"] = ""  # нет такого в исходнике
 
+    # телефон как есть, но нормализуем текст
+    out["Телефон"] = safe_col(df, c_phone).astype(str).map(norm_text) if c_phone else ""
+
+    # объем: парсим и округляем до 2 знаков (на уровне источника)
+    if c_volume:
+        v_series = safe_col(df, c_volume).apply(lambda x: round(parse_num(x, 0.0), 2))
+    else:
+        v_series = pd.Series([0.0] * len(df))
+    out["Объем заказа"] = v_series
+
+    # адрес: чистим под геокод и под человека
+    out["Адрес доставки"] = safe_col(df, c_addr).astype(str).map(clean_addr) if c_addr else ""
+
+    # количество и наименование
+    out["Количество товара"] = safe_col(df, c_qty).apply(lambda x: int(parse_num(x, 0))) if c_qty else 0
+    out["наименование"]      = safe_col(df, c_items).astype(str).map(norm_text) if c_items else ""
+
+    # план-время-дата
     if c_date and c_time:
-        date_col = safe_col(df, c_date)
-        time_col = safe_col(df, c_time)
+        date_col = safe_col(df, c_date).astype(str).map(norm_text)
+        time_col = safe_col(df, c_time).astype(str).map(norm_text)
         dt_series = pd.to_datetime(
-            date_col.astype(str).str.strip() + " " + time_col.astype(str).str.strip(),
+            date_col.str.strip() + " " + time_col.str.strip(),
             dayfirst=True, errors="coerce"
         )
         out["План время дата"] = dt_series.dt.strftime("%d.%m.%Y %H:%M").fillna(
-            (date_col.astype(str) + " " + time_col.astype(str)).str.strip()
+            (date_col + " " + time_col).str.strip()
         )
     elif c_date:
-        out["План время дата"] = safe_col(df, c_date).astype(str)
+        out["План время дата"] = safe_col(df, c_date).astype(str).map(norm_text)
     elif c_time:
-        out["План время дата"] = safe_col(df, c_time).astype(str)
+        out["План время дата"] = safe_col(df, c_time).astype(str).map(norm_text)
     else:
         out["План время дата"] = ""
 
-    # фильтрация мусора (шапки типа "Доставка товара клиенту")
+    # фильтруем мусорные шапки-строки
     out = out[out["наименование"].astype(str).str.strip() != "Доставка товара клиенту"]
 
-    # --- группировка по номеру заявки ---
+    # --- группировка по номеру заявки и итоговое округление после суммирования ---
     if not out.empty and "номер заявки" in out.columns:
         agg_funcs = {
             "Вес заказа": "sum",
@@ -367,64 +443,20 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             "Объем заказа": "sum",
             "Адрес доставки": "first",
             "Количество товара": "sum",
-            "наименование": lambda x: ", ".join([str(v).strip() for v in x if v and v.strip() != ""]),
+            "наименование": lambda x: ", ".join([str(v).strip() for v in x if str(v).strip()]),
             "План время дата": "first",
         }
         out = out.groupby("номер заявки", as_index=False).agg(agg_funcs)
 
+        # финальное округление после агрегации
+        out["Вес заказа"] = out["Вес заказа"].apply(lambda x: round(parse_num(x, 0.0), 1))
+        out["Объем заказа"] = out["Объем заказа"].apply(lambda x: round(parse_num(x, 0.0), 2))
+        # Количество товара на всякий случай к int
+        out["Количество товара"] = out["Количество товара"].apply(lambda x: int(parse_num(x, 0)))
+
     out = out.reset_index(drop=True)
-    logger.debug(f"Итог к загрузке: строк {len(out)}")
+    logger.debug(f"Итог к загрузке: строк {len(out)}; примеры объёмов: {out['Объем заказа'].head(5).tolist()}; весов: {out['Вес заказа'].head(5).tolist()}")
     return out
-
-# === ОБРАБОТКА ФАЙЛОВ ОТ АДМИНА ===
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⚠️ Загружать файлы может только администратор.")
-        return
-
-    document = update.message.document
-    if not document or not document.file_name.lower().endswith((".xls", ".xlsx")):
-        await update.message.reply_text("⚠️ Пришлите Excel-файл (.xlsx или .xls).")
-        return
-
-    tg_file = await document.get_file()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(document.file_name)[1]) as tmp:
-        await tg_file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
-
-    try:
-        frames = []
-        for df_raw in read_excel_flex(tmp_path, document.file_name):
-            try:
-                df_ready = build_import_dataframe(df_raw)
-                if not df_ready.empty:
-                    frames.append(df_ready)
-            except Exception as e:
-                logger.warning(f"Лист пропущен: {e}")
-
-        if not frames:
-            await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки/лист.")
-            return
-
-        df_all = pd.concat(frames, ignore_index=True)
-        if df_all.empty:
-            await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте формат.")
-            return
-
-        rows = df_all.values.tolist()
-        sheet.append_rows(rows, value_input_option="USER_ENTERED")
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧭 Распределить маршруты", callback_data="optimize")]
-        ])
-        await update.message.reply_text(
-            f"✅ Файл обработан. Добавлено заявок: {len(rows)}.\nНажмите кнопку ниже:",
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        logger.error(f"Ошибка обработки файла: {e}")
-        await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
 
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
