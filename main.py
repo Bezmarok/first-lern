@@ -458,6 +458,61 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     logger.debug(f"Итог к загрузке: строк {len(out)}; примеры объёмов: {out['Объем заказа'].head(5).tolist()}; весов: {out['Вес заказа'].head(5).tolist()}")
     return out
 
+    # === ОБРАБОТКА ФАЙЛОВ ОТ АДМИНА ===
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⚠️ Загружать файлы может только администратор.")
+        return
+
+    document = update.message.document
+    if not document or not document.file_name.lower().endswith((".xls", ".xlsx")):
+        await update.message.reply_text("⚠️ Пришлите Excel-файл (.xlsx или .xls).")
+        return
+
+    tg_file = await document.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(document.file_name)[1]) as tmp:
+        await tg_file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        frames = []
+        for df_raw in read_excel_flex(tmp_path, document.file_name):
+            try:
+                df_ready = build_import_dataframe(df_raw)
+                if not df_ready.empty:
+                    # округление здесь, чтобы дальше всё шло чистое
+                    if "Вес заказа" in df_ready.columns:
+                        df_ready["Вес заказа"] = pd.to_numeric(df_ready["Вес заказа"], errors="coerce").fillna(0).round(1)
+                    if "Объем заказа" in df_ready.columns:
+                        df_ready["Объем заказа"] = pd.to_numeric(df_ready["Объем заказа"], errors="coerce").fillna(0).round(2)
+                    frames.append(df_ready)
+            except Exception as e:
+                logger.warning(f"Лист пропущен: {e}")
+
+        if not frames:
+            await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки/лист.")
+            return
+
+        df_all = pd.concat(frames, ignore_index=True)
+        if df_all.empty:
+            await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте формат.")
+            return
+
+        rows = df_all.values.tolist()
+        sheet.append_rows(rows, value_input_option="USER_ENTERED")
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧭 Распределить маршруты", callback_data="optimize")]
+        ])
+        await update.message.reply_text(
+            f"✅ Файл обработан. Добавлено заявок: {len(rows)}.\nНажмите кнопку ниже:",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error(f"Ошибка обработки файла: {e}")
+        await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
+
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
     """
