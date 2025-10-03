@@ -36,6 +36,48 @@ client = gspread.authorize(creds)
 SHEET_NAME = "Cargodeliver"
 sheet = client.open(SHEET_NAME).sheet1
 
+def sync_drivers_from_sheet():
+    """
+    Читает данные о водителях из листа 'Водители' и синхронизирует с drivers_data.
+    Структура листа:
+      A: Объем (м³)
+      B: Вес (кг)
+      C: Гос. номер
+      D: Принадлежность ('наш' / 'найм')
+    Возвращает словарь drivers_data.
+    """
+    try:
+        ws = client.open(SHEET_NAME).worksheet("Водители")
+    except Exception as e:
+        logger.error(f"Не найден лист 'Водители': {e}")
+        return {}
+
+    records = ws.get_all_records()
+    drivers = {}
+    for idx, row in enumerate(records, start=2):  # строка 2, потому что 1 — заголовки
+        try:
+            vol = float(str(row.get("Объем", "")).replace(",", ".") or 0)
+            wgt = float(str(row.get("Вес", "")).replace(",", ".") or 0)
+            plate = str(row.get("Гос номер", "")).strip()
+            owner = str(row.get("Принадлежность", "")).strip().lower()
+
+            if not owner:  # если нет принадлежности — игнорируем
+                continue
+
+            drivers[idx] = {
+                "volume": vol,
+                "weight": wgt,
+                "car_plate": plate,
+                "owner_type": owner,   # 'наш' или 'найм'
+                "username": f"id_{idx}"  # заглушка (пока не знаем юзернейм)
+            }
+        except Exception as e:
+            logger.warning(f"Ошибка чтения водителя из строки {idx}: {e}")
+            continue
+
+    logger.info(f"Синхронизация: найдено водителей {len(drivers)}")
+    return drivers
+
 # === ОКРУЖЕНИЕ ===
 ORS_API_KEY = os.environ.get("ORS_API_KEY")
 if not ORS_API_KEY:
@@ -155,10 +197,27 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
+# === Глобальный кэш геокодинга ===
+addr_cache = {}
+
 def geocode_address(address: str):
+    """
+    Геокодирование адреса через OpenRouteService с кэшированием.
+    Возвращает (lon, lat) или (None, None).
+    """
+    if not address:
+        return (None, None)
+
+    # чистим индекс и пробелы
+    addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
+
+    # проверяем в кэше
+    if addr in addr_cache:
+        logger.debug(f"[CACHE] Геокод найден для '{addr}' -> {addr_cache[addr]}")
+        return addr_cache[addr]
+
     try:
         url = "https://api.openrouteservice.org/geocode/search"
-        addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
         params = {
             "api_key": ORS_API_KEY,
             "text": addr,
@@ -173,6 +232,7 @@ def geocode_address(address: str):
         data = r.json()
         feats = data.get("features", [])
         if not feats:
+            logger.warning(f"Геокодинг: нет результатов для '{addr}'")
             return (None, None)
 
         # выбираем ближайший к складу результат
@@ -184,7 +244,14 @@ def geocode_address(address: str):
             if dist < best_dist:
                 best_dist = dist
                 best = (float(lon), float(lat))
-        return best if best else (None, None)
+
+        if best:
+            addr_cache[addr] = best
+            logger.debug(f"[GEOCODE] '{addr}' -> {best} (добавлено в кэш)")
+            return best
+
+        return (None, None)
+
     except Exception as e:
         logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
         return (None, None)
@@ -266,9 +333,11 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
       • Округление: Объем -> 2 знака, Вес -> 1 знак
       • Чистку адреса (индекс/кв./офис/лит./строение/дубли города)
       • Группировку по "номер заявки"
+      • Извлечение стоимости доставки
     Возвращает DataFrame с колонками:
       ["номер заявки","Вес заказа","Вид перевозки","Телефон","Объем заказа",
-       "Адрес доставки","Количество товара","наименование","План время дата"]
+       "Адрес доставки","Количество товара","наименование","План время дата",
+       "Стоимость доставки (для расчёта)"]
     """
     if df_raw.empty:
         return pd.DataFrame()
@@ -295,24 +364,15 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         if not addr:
             return ""
         s = str(addr)
-
-        # вырезаем индекс в начале
-        s = re.sub(r"^\s*\d{5,6}\s*,\s*", "", s)
-
-        # раздутая конструкция "Россия, Санкт-Петербург, Санкт-Петербург" -> один раз
+        s = re.sub(r"^\s*\d{5,6}\s*,\s*", "", s)  # индекс в начале
         s = s.replace("Россия, Санкт-Петербург, Санкт-Петербург", "Россия, Санкт-Петербург")
-
-        # убираем квартиры/офисы/помещения/литеры/строения
         s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)",
                    "", s, flags=re.IGNORECASE)
-
-        # убираем повторяющиеся сегменты типа "Санкт-Петербург, Санкт-Петербург"
         parts = [p.strip() for p in s.split(",") if p.strip()]
         dedup = []
         for p in parts:
             if not dedup or p.lower() != dedup[-1].lower():
                 dedup.append(p)
-
         s = ", ".join(dedup)
         s = re.sub(r"\s{2,}", " ", s)
         s = re.sub(r",+", ",", s)
@@ -323,7 +383,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             return ""
         return re.sub(r"[\r\n\t]+", " ", str(x)).strip()
 
-    # --- определяем шапку и режем пустоту ---
+    # --- определяем шапку ---
     hdr = detect_header_row(df_raw)
     header_row = df_raw.iloc[hdr].tolist()
     headers = _make_headers_from_row(header_row)
@@ -332,22 +392,21 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     logger.debug(f"Найдены заголовки: {list(df.columns)}")
 
-    # удаляем полностью пустые колонки
     df = df.loc[:, ~df.apply(lambda col: col.astype(str).str.strip().isin(["", "nan", "None"]).all())]
-    # тянем значения сверху (часто шапка/дата растянута)
     df = df.ffill()
 
-    # --- гибкий поиск колонок-источников ---
+    # --- гибкий поиск колонок ---
     src_cols = {
-        "order":  ["Номер заявки", "номер заявки", "Номер", "ID", "Заявка"],
-        "date":   ["Дата доставки", "Дата"],
-        "time":   ["Время доставки", "Время"],
-        "items":  ["Список товаров", "наименование", "Наименование"],
-        "qty":    ["Кол-во товара", "Количество товара", "Количество"],
-        "volume": ["Объем заказа", "Обьем заказа", "Объем", "Обьем", "м3", "М3"],
-        "weight": ["Вес заказа", "Вес"],
-        "addr":   ["Адрес доставки", "Адрес"],
-        "phone":  ["Телефон клиента", "Телефон"],
+        "order":    ["Номер заявки", "номер заявки", "Номер", "ID", "Заявка"],
+        "date":     ["Дата доставки", "Дата"],
+        "time":     ["Время доставки", "Время"],
+        "items":    ["Список товаров", "наименование", "Наименование"],
+        "qty":      ["Кол-во товара", "Количество товара", "Количество"],
+        "volume":   ["Объем заказа", "Обьем заказа", "Объем", "Обьем", "м3", "М3"],
+        "weight":   ["Вес заказа", "Вес"],
+        "addr":     ["Адрес доставки", "Адрес"],
+        "phone":    ["Телефон клиента", "Телефон"],
+        "price":    ["Стоимость доставки", "Стоимость доставки, руб.", "стоимость доставки"],  # <── вот она
     }
 
     def pick(names):
@@ -363,57 +422,51 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     c_weight = pick(src_cols["weight"])
     c_addr   = pick(src_cols["addr"])
     c_phone  = pick(src_cols["phone"])
+    c_price  = pick(src_cols["price"])
 
-    # --- целевая форма под Google Sheets ---
+    # --- целевые колонки ---
     target_cols = [
-        "номер заявки",        # A
-        "Вес заказа",          # B
-        "Вид перевозки",       # C
-        "Телефон",             # D
-        "Объем заказа",        # E
-        "Адрес доставки",      # F
-        "Количество товара",   # G
-        "наименование",        # H
-        "План время дата"      # I
+        "номер заявки",
+        "Вес заказа",
+        "Вид перевозки",
+        "Телефон",
+        "Объем заказа",
+        "Адрес доставки",
+        "Количество товара",
+        "наименование",
+        "План время дата",
+        "Стоимость доставки (для расчёта)"
     ]
     out = pd.DataFrame(columns=target_cols)
 
-    # --- заполняем поля, сразу чистим и округляем ---
+    # --- наполнение ---
     def clean_order(v) -> str:
         s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
         s = re.sub(r"[гГ\-]", "", s)
         return re.sub(r"[^0-9A-Za-z]", "", s)
 
-    # номер заявки
     out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
 
-    # вес: парсим и округляем до 1 знака (на уровне источника)
     if c_weight:
         w_series = safe_col(df, c_weight).apply(lambda x: round(parse_num(x, 0.0), 1))
     else:
         w_series = pd.Series([0.0] * len(df))
     out["Вес заказа"] = w_series
 
-    out["Вид перевозки"] = ""  # нет такого в исходнике
+    out["Вид перевозки"] = ""
 
-    # телефон как есть, но нормализуем текст
     out["Телефон"] = safe_col(df, c_phone).astype(str).map(norm_text) if c_phone else ""
 
-    # объем: парсим и округляем до 2 знаков (на уровне источника)
     if c_volume:
         v_series = safe_col(df, c_volume).apply(lambda x: round(parse_num(x, 0.0), 2))
     else:
         v_series = pd.Series([0.0] * len(df))
     out["Объем заказа"] = v_series
 
-    # адрес: чистим под геокод и под человека
     out["Адрес доставки"] = safe_col(df, c_addr).astype(str).map(clean_addr) if c_addr else ""
-
-    # количество и наименование
     out["Количество товара"] = safe_col(df, c_qty).apply(lambda x: int(parse_num(x, 0))) if c_qty else 0
-    out["наименование"]      = safe_col(df, c_items).astype(str).map(norm_text) if c_items else ""
+    out["наименование"] = safe_col(df, c_items).astype(str).map(norm_text) if c_items else ""
 
-    # план-время-дата
     if c_date and c_time:
         date_col = safe_col(df, c_date).astype(str).map(norm_text)
         time_col = safe_col(df, c_time).astype(str).map(norm_text)
@@ -431,10 +484,13 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     else:
         out["План время дата"] = ""
 
-    # фильтруем мусорные шапки-строки
-    out = out[out["наименование"].astype(str).str.strip() != "Доставка товара клиенту"]
+    # стоимость доставки
+    if c_price:
+        out["Стоимость доставки (для расчёта)"] = safe_col(df, c_price).apply(lambda x: round(parse_num(x, 0.0), 2))
+    else:
+        out["Стоимость доставки (для расчёта)"] = 0.0
 
-    # --- группировка по номеру заявки и итоговое округление после суммирования ---
+    # группировка
     if not out.empty and "номер заявки" in out.columns:
         agg_funcs = {
             "Вес заказа": "sum",
@@ -445,17 +501,17 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             "Количество товара": "sum",
             "наименование": lambda x: ", ".join([str(v).strip() for v in x if str(v).strip()]),
             "План время дата": "first",
+            "Стоимость доставки (для расчёта)": "sum"
         }
         out = out.groupby("номер заявки", as_index=False).agg(agg_funcs)
 
-        # финальное округление после агрегации
         out["Вес заказа"] = out["Вес заказа"].apply(lambda x: round(parse_num(x, 0.0), 1))
         out["Объем заказа"] = out["Объем заказа"].apply(lambda x: round(parse_num(x, 0.0), 2))
-        # Количество товара на всякий случай к int
         out["Количество товара"] = out["Количество товара"].apply(lambda x: int(parse_num(x, 0)))
+        out["Стоимость доставки (для расчёта)"] = out["Стоимость доставки (для расчёта)"].apply(lambda x: round(parse_num(x, 0.0), 2))
 
     out = out.reset_index(drop=True)
-    logger.debug(f"Итог к загрузке: строк {len(out)}; примеры объёмов: {out['Объем заказа'].head(5).tolist()}; весов: {out['Вес заказа'].head(5).tolist()}")
+    logger.debug(f"Итог к загрузке: строк {len(out)}; примеры стоимостей: {out['Стоимость доставки (для расчёта)'].head(5).tolist()}")
     return out
 
     # === ОБРАБОТКА ФАЙЛОВ ОТ АДМИНА ===
@@ -674,7 +730,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
 def build_vehicles_from_drivers():
     """
     Собирает список машин для ORS.
-    Вместимость теперь в м³ и кг (те же единицы, что и у jobs).
+    Вместимость в м³ и кг (те же единицы, что и у jobs).
+    Источник данных — лист "Водители" в Google Sheets.
     """
     vehicles = []
     try:
@@ -684,28 +741,38 @@ def build_vehicles_from_drivers():
         logger.error("⚠️ Неверные координаты склада. Проверь WAREHOUSE_LAT/LON.")
         return vehicles
 
+    # подтягиваем водителей из листа
+    drivers = sync_drivers_from_sheet()
+
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today
     end = today + timedelta(days=3, hours=23, minutes=59)
 
-    for user_id, drv in drivers_data.items():
+    for user_id, drv in drivers.items():
         try:
             vol_cap_m3 = float(drv["volume"])
             wgt_cap_kg = float(drv["weight"])
+            owner_type = drv.get("owner_type", "").strip().lower()
+
+            if not owner_type:
+                logger.info(f"Водитель {user_id} пропущен (нет принадлежности).")
+                continue
+
+            vehicle = {
+                "id": int(user_id),
+                "profile": "driving-car",
+                "start": [s_lon, s_lat],
+                "end": [s_lon, s_lat],
+                "time_window": [to_unix(start), to_unix(end)],
+                "capacity": [vol_cap_m3, wgt_cap_kg],
+                "description": drv.get("username", f"id_{user_id}"),
+                "car_plate": drv.get("car_plate", ""),
+                "owner_type": owner_type  # <── теперь хранится здесь
+            }
+            vehicles.append(vehicle)
         except Exception as e:
             logger.warning(f"⚠️ У водителя {user_id} некорректные параметры: {e}")
             continue
-
-        vehicle = {
-            "id": int(user_id),
-            "profile": "driving-car",
-            "start": [s_lon, s_lat],
-            "end": [s_lon, s_lat],
-            "time_window": [to_unix(start), to_unix(end)],
-            "capacity": [vol_cap_m3, wgt_cap_kg],
-            "description": drv.get("username", f"id_{user_id}")
-        }
-        vehicles.append(vehicle)
 
     for v in vehicles:
         if not isinstance(v, dict) or "id" not in v:
@@ -779,11 +846,20 @@ def extract_unassigned_ids(unassigned):
 # === TELEGRAM UI ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("Привет, админ! Пришли Excel-файл с заявками (.xlsx/.xls).")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧭 Оптимизация", callback_data="optimize")],
+            [InlineKeyboardButton("📊 Итоги дня", callback_data="summary")]
+        ])
+        await update.message.reply_text("Привет, админ! Выберите действие:", reply_markup=keyboard)
     else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
+        ])
         await update.message.reply_text(
-            "Укажи параметры машины, например:\n`2.5, 500, А123ВС78`\n(объём м³, вес кг, госномер)",
-            parse_mode="Markdown"
+            "Укажи параметры машины, например:\n`2.5, 500, А123ВС78`\n(объём м³, вес кг, госномер)\n\n"
+            "После назначения маршрута вы сможете смотреть свой доход.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,16 +868,69 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
         plate_str = rest[0] if rest else ""
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
+
+        vol = float(volume_str.strip().replace(",", "."))
+        wgt = float(weight_str.strip().replace(",", "."))
+        plate = plate_str.strip()
+
+        # обновляем RAM
         drivers_data[user_id] = {
-            "volume": float(volume_str.strip().replace(",", ".")),
-            "weight": float(weight_str.strip().replace(",", ".")),
+            "volume": vol,
+            "weight": wgt,
             "username": username,
-            "car_plate": plate_str.strip()
+            "car_plate": plate,
+            "owner_type": ""  # будет заполнено админом вручную в таблице
         }
+
+        # пишем в лист "Водители"
+        try:
+            ws = client.open(SHEET_NAME).worksheet("Водители")
+            ws.append_row([vol, wgt, plate, ""])  # принадлежность админ поставит вручную
+        except Exception as e:
+            logger.error(f"Не удалось записать водителя в лист 'Водители': {e}")
+
         await update.message.reply_text("✅ Данные сохранены. Ждите назначение заявок.")
     except Exception as e:
         logger.error(f"Ошибка регистрации водителя: {e}")
         await update.message.reply_text("⚠️ Неверный формат. Пример: `2.5, 500, А123ВС78`", parse_mode="Markdown")
+
+async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ws = client.open(SHEET_NAME).sheet1
+    records = ws.get_all_records()
+
+    ws_drivers = client.open(SHEET_NAME).worksheet("Водители")
+    drivers = ws_drivers.get_all_records()
+
+    driver_info = next((d for d in drivers if str(d.get("id","")) == str(user_id)), None)
+    if not driver_info:
+        await update.message.reply_text("⚠️ Вы не зарегистрированы в системе.")
+        return
+
+    owner_type = driver_info.get("Принадлежность","").strip().lower()
+    percent = 0.6 if owner_type == "найм" else 0.4
+
+    total_today = total_week = total_month = 0
+    now = datetime.now()
+
+    for row in records:
+        if str(row.get("Водитель","")) == update.effective_user.username:
+            price = float(row.get("Стоимость доставки (для расчёта)",0) or 0)
+            dt = try_parse_datetime(row.get("Факт Дата и время"))
+            if not dt:
+                continue
+            if dt.date() == now.date():
+                total_today += price*percent
+            if dt.isocalendar()[1] == now.isocalendar()[1]:
+                total_week += price*percent
+            if dt.month == now.month and dt.year == now.year:
+                total_month += price*percent
+
+    msg = f"💰 Ваш заработок:\n" \
+          f"Сегодня: {total_today:.2f} ₽\n" \
+          f"Эта неделя: {total_week:.2f} ₽\n" \
+          f"Этот месяц: {total_month:.2f} ₽"
+    await update.message.reply_text(msg)
 
 def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     rows = [[
@@ -813,13 +942,44 @@ def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
         rows.append([InlineKeyboardButton("📍 Маршрут", url=route_url)])
     return InlineKeyboardMarkup(rows)
 
+async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    ws = client.open(SHEET_NAME).sheet1
+    records = ws.get_all_records()
+    ws_drivers = client.open(SHEET_NAME).worksheet("Водители")
+    drivers = ws_drivers.get_all_records()
+
+    summary = {}
+    now = datetime.now()
+
+    for row in records:
+        if str(row.get("Статус","")).lower() != "выполнено":
+            continue
+        driver_name = str(row.get("Водитель","")).strip()
+        if not driver_name:
+            continue
+        price = float(row.get("Стоимость доставки (для расчёта)",0) or 0)
+
+        driver_info = next((d for d in drivers if d.get("Гос номер","") == row.get("Гос номер","")), None)
+        owner_type = driver_info.get("Принадлежность","").strip().lower() if driver_info else ""
+        percent = 0.6 if owner_type == "найм" else 0.4
+
+        dt = try_parse_datetime(row.get("Факт Дата и время"))
+        if not dt or dt.date() != now.date():
+            continue
+
+        summary.setdefault(driver_name, 0)
+        summary[driver_name] += price * percent
+
+    lines = [f"{d}: {s:.2f} ₽" for d, s in summary.items()]
+    total = sum(summary.values())
+    msg = "📊 Итоги дня:\n" + "\n".join(lines) + f"\n\nИтого по всем: {total:.2f} ₽"
+    await update.message.reply_text(msg)
+
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
-async def optimize_and_assign(bot):
-    """
-    Основная функция: строит задачи из Google Sheets (dict-строки),
-    оптимизирует маршруты через ORS и распределяет заявки.
-    Работает полностью через get_all_records().
-    """
+async def optimize_and_assign(bot, context=None):
     rows = sheet.get_all_records()
 
     if not drivers_data:
@@ -853,20 +1013,6 @@ async def optimize_and_assign(bot):
     unassigned_raw = solution.get("unassigned", [])
     unassigned_ids = extract_unassigned_ids(unassigned_raw)
 
-    # --- сообщение админу про нераспределённые заявки ---
-    if unassigned_ids:
-        job_by_id = {j["id"]: j for j in jobs}
-        lines = []
-        for jid in unassigned_ids:
-            idx = row_index_by_job_id.get(jid)
-            order_no = job_info.get(jid, {}).get("order_no", str(jid))
-            reason = reason_for_unassigned(job_by_id.get(jid, {}), vehicles)
-            lines.append(f"• №{order_no} — {reason}")
-        msg = "⚠️ Нераспределены заявки:\n" + "\n".join(lines) + \
-              "\n\nДобавьте машины или перенесите нераспределённые заявки на другой день."
-        await bot.send_message(chat_id=ADMIN_ID, text=msg)
-
-    # --- формируем маршруты по машинам ---
     routes_by_vehicle = {}
     for r in routes:
         vid = int(r["vehicle"])
@@ -876,84 +1022,103 @@ async def optimize_and_assign(bot):
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
-    # --- обновление статусов в таблице (пакетно) ---
-    updates = []
+    # сохраняем в bot_data
+    if context:
+        context.bot_data["routes_by_vehicle"] = routes_by_vehicle
+        context.bot_data["job_info"] = job_info
+        context.bot_data["rows"] = rows
+        context.bot_data["row_index_by_job_id"] = row_index_by_job_id
+
+    # сообщение админу
     for vid, data in routes_by_vehicle.items():
-        drv = drivers_data.get(vid)
-        driver_username = drv["username"] if drv else f"id_{vid}"
+        drv = next((d for d in vehicles if d["id"] == vid), None)
+        if not drv:
+            continue
 
-        for s in data["steps"]:
-            job_id = int(s["job"])
-            row_idx = row_index_by_job_id.get(job_id)   # индекс строки из get_all_records() + 2 (заголовки)
-            if not row_idx:
-                continue
-            # Excel-нумерация: реальная строка = row_idx (так как start=2 в build_jobs_from_sheet)
-            sheet_row = row_idx
-
-            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-
-            # готовим обновления
-            if COL_STATUS:   updates.append((sheet_row, COL_STATUS, "выполняется"))
-            if COL_DRIVER:   updates.append((sheet_row, COL_DRIVER, driver_username))
-            if COL_UPDATED:  updates.append((sheet_row, COL_UPDATED, now_human()))
-            if COL_ETA and eta_str: updates.append((sheet_row, COL_ETA, eta_str))
-            if COL_CAR_PLATE and drv: updates.append((sheet_row, COL_CAR_PLATE, drv.get("car_plate", "")))
-
-    # выполняем обновления пачкой
-    for row, col_idx, value in updates:
-        try:
-            sheet.update_cell(row, col_idx, value)
-        except Exception as e:
-            logger.error(f"Не удалось обновить ячейку ({row},{col_idx}): {e}")
-
-    # --- отправляем маршруты водителям ---
-    for vid, data in routes_by_vehicle.items():
-        drv = drivers_data.get(vid)
-        username = drv["username"] if drv else f"id_{vid}"
         job_steps = data["steps"]
-
         total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
         total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
 
+        total_price = 0.0
         lines = []
         for s in job_steps:
             jid = int(s["job"])
             info = job_info.get(jid, {})
             eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-            lines.append(f"• №{info.get('order_no', jid)} — {info.get('addr', '')}" + (f" (ETA {eta_str})" if eta_str else ""))
+            price_val = 0.0
+            try:
+                row_idx = row_index_by_job_id.get(jid)
+                if row_idx and "Стоимость доставки (для расчёта)" in rows[row_idx-2]:
+                    price_val = float(rows[row_idx-2].get("Стоимость доставки (для расчёта)", 0) or 0)
+            except Exception:
+                price_val = 0.0
+            total_price += price_val
+            lines.append(
+                f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
+                + (f" (ETA {eta_str})" if eta_str else "")
+                + (f" | {price_val:.2f} ₽" if price_val else "")
+            )
 
-        route_text = f"🧭 Оптимальный маршрут на сегодня:\n" + ("\n".join(lines) if lines else "Заявок нет")
-        if lines:
-            route_text += f"\n\nИтого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг"
-        route_text += f"\n🛣 Пробег маршрута: ~{data['route_km']:.1f} км"
+        route_text = f"🚚 Маршрут для {drv.get('description','')}\n"
+        route_text += f"Заявок: {len(job_steps)}\n"
+        route_text += f"Итого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг\n"
+        route_text += f"Пробег: ~{data['route_km']:.1f} км\n"
+        route_text += f"Сумма заказов: {total_price:.2f} ₽\n\n"
+        route_text += "\n".join(lines) if lines else "Заявок нет"
 
-        try:
-            await bot.send_message(chat_id=vid, text=route_text)
-        except Exception as e:
-            logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-            await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить {username} (id={vid}).")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Назначить водителю", callback_data=f"assign:{vid}")],
+            [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
+            [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
+        ])
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("♻️ Распределить повторно", callback_data="optimize_again")]])
-    await bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"✅ Готово. Маршрутов: {len(routes)}. Нераспределены: {len(unassigned_ids)}.",
-        reply_markup=kb
-    )
+        await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
 
-# === КНОПКИ ===
+# === ОБРАБОТЧИК КНОПОК ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     await query.answer()
 
+    # === Оптимизация маршрутов ===
     if data in ("optimize", "optimize_again"):
-        await optimize_and_assign(context.bot)
+        await optimize_and_assign(context.bot, context)
         try:
-            await query.edit_message_text("🔄 Маршруты построены и разосланы!")
+            await query.edit_message_text("🔄 Маршруты построены и разосланы админу!")
         except Exception:
             pass
         return
 
+    # === Итоги дня (админ) ===
+    if data == "summary":
+        await daily_summary(update, context)
+        return
+
+    # === Заработок (водитель) ===
+    if data == "earnings":
+        await earnings(update, context)
+        return
+
+    # === Отложить маршрут ===
+    if data.startswith("skip:"):
+        vid = int(data.split(":")[1])
+        await query.edit_message_text(f"⏸ Маршрут для водителя {vid} отложен.")
+        return
+
+    # === Назначение маршрута ===
+    if data.startswith("assign:"):
+        vid = int(data.split(":")[1])
+        await send_route_to_driver(context.bot, vid)
+        await query.edit_message_text(f"✅ Маршрут назначен водителю {vid}")
+        return
+
+    # === Редактирование маршрута (пока простая заглушка) ===
+    if data.startswith("edit:"):
+        vid = int(data.split(":")[1])
+        await query.edit_message_text(f"✏️ Редактирование маршрута для водителя {vid} (в разработке)")
+        return
+
+    # === Завершение заявок (done/fail) ===
     try:
         if data.startswith("done:") or data.startswith("fail:"):
             row_idx = int(data.split(":")[1])
@@ -988,11 +1153,100 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Не удалось уведомить админа об изменении статуса: {e}")
+
+            # === Запись в историю ===
+            try:
+                ws_history = client.open(SHEET_NAME).worksheet("История")
+                ws_history.append_row([
+                    now_human(),                       # дата/время
+                    order_no_from_col_A(row_idx),      # номер заявки
+                    query.from_user.username,          # кто выполнял
+                    status_value,                      # статус
+                    sheet.cell(row_idx, col("Стоимость доставки (для расчёта)")).value or 0
+                ])
+                logger.debug(f"История: записана строка для {row_idx}")
+            except Exception as e:
+                logger.error(f"Не удалось записать историю: {e}")
+
             return
     except Exception as e:
         logger.error(f"Ошибка обработки кнопки {data}: {e}")
         await query.message.reply_text("⚠️ Не удалось обновить статус. Сообщите админу.")
         return
+
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ===
+routes_by_vehicle = {}   # глобально храним маршруты после оптимизации
+job_info = {}
+row_index_by_job_id = {}
+rows = []
+
+async def send_route_to_driver(bot, vid: int):
+    """
+    Отправляет маршрут конкретному водителю после того,
+    как админ нажал кнопку "Назначить водителю".
+    """
+    routes_by_vehicle = bot.bot_data.get("routes_by_vehicle", {})
+    job_info = bot.bot_data.get("job_info", {})
+
+    data = routes_by_vehicle.get(vid)
+    if not data:
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Нет маршрута для водителя {vid}.")
+        return
+
+    drv = drivers_data.get(vid, {})
+    username = drv.get("username", f"id_{vid}")
+    job_steps = data["steps"]
+
+    total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
+    total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
+
+    lines = []
+    for s in job_steps:
+        jid = int(s["job"])
+        info = job_info.get(jid, {})
+        eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+        lines.append(
+            f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
+            + (f" (ETA {eta_str})" if eta_str else "")
+        )
+
+    route_text = f"🧭 Ваш маршрут на сегодня:\n" + ("\n".join(lines) if lines else "Заявок нет")
+    if lines:
+        route_text += f"\n\nИтого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг"
+    route_text += f"\n🛣 Пробег маршрута: ~{data['route_km']:.1f} км"
+
+    try:
+        await bot.send_message(chat_id=vid, text=route_text)
+        await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {username} (id={vid}).")
+    except Exception as e:
+        logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить {username} (id={vid}).")
+
+async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
+    """
+    Заготовка: вход в режим редактирования маршрута.
+    Показывает список заказов с кнопками "убрать".
+    """
+    global routes_by_vehicle, job_info
+    data = routes_by_vehicle.get(vid, {})
+    job_steps = data.get("steps", [])
+    if not job_steps:
+        await update.effective_message.reply_text("⚠️ У этого маршрута нет заказов.")
+        return
+
+    # строим кнопки для удаления заказов
+    buttons = []
+    for s in job_steps:
+        jid = int(s["job"])
+        order_no = job_info.get(jid, {}).get("order_no", str(jid))
+        buttons.append([InlineKeyboardButton(f"🗑 Убрать заказ №{order_no}", callback_data=f"remove:{vid}:{jid}")])
+
+    kb = InlineKeyboardMarkup(buttons + [
+        [InlineKeyboardButton("♻️ Пересчитать маршрут", callback_data=f"recalc:{vid}")],
+        [InlineKeyboardButton("↩️ Отмена", callback_data="cancel_edit")]
+    ])
+    await update.effective_message.reply_text("Выберите заказы для удаления:", reply_markup=kb)
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
@@ -1005,4 +1259,6 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
+    app.add_handler(CommandHandler("earnings", earnings))
+    app.add_handler(CommandHandler("summary", daily_summary))
     app.run_polling()
