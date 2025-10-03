@@ -383,6 +383,13 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             return ""
         return re.sub(r"[\r\n\t]+", " ", str(x)).strip()
 
+    def join_items(x):
+        """Агрегатор списка товаров с ограничением"""
+        items = [str(v).strip() for v in x if str(v).strip()]
+        if len(items) > 5:
+            return ", ".join(items[:5]) + f" …и ещё {len(items)-5} позиций"
+        return ", ".join(items)
+
     # --- определяем шапку ---
     hdr = detect_header_row(df_raw)
     header_row = df_raw.iloc[hdr].tolist()
@@ -406,7 +413,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         "weight":   ["Вес заказа", "Вес"],
         "addr":     ["Адрес доставки", "Адрес"],
         "phone":    ["Телефон клиента", "Телефон"],
-        "price":    ["Стоимость доставки", "Стоимость доставки, руб.", "стоимость доставки"],  # <── вот она
+        "price":    ["Стоимость доставки", "Стоимость доставки, руб.", "стоимость доставки"],
     }
 
     def pick(names):
@@ -443,7 +450,9 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     def clean_order(v) -> str:
         s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
         s = re.sub(r"[гГ\-]", "", s)
-        return re.sub(r"[^0-9A-Za-z]", "", s)
+        s = re.sub(r"[^0-9A-Za-z]", "", s)
+        s = s.lstrip("0")  # убираем ведущие нули
+        return s.upper()
 
     out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
 
@@ -499,9 +508,9 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             "Объем заказа": "sum",
             "Адрес доставки": "first",
             "Количество товара": "sum",
-            "наименование": lambda x: ", ".join([str(v).strip() for v in x if str(v).strip()]),
+            "наименование": join_items,
             "План время дата": "first",
-            "Стоимость доставки (для расчёта)": "sum"
+            "Стоимость доставки (для расчёта)": "first"
         }
         out = out.groupby("номер заявки", as_index=False).agg(agg_funcs)
 
