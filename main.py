@@ -14,7 +14,7 @@ import gspread
 import pandas as pd
 import requests
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters,
     CallbackQueryHandler, ContextTypes
@@ -854,13 +854,22 @@ def extract_unassigned_ids(unassigned):
     return ids
 # === TELEGRAM UI ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧭 Оптимизация", callback_data="optimize")],
-            [InlineKeyboardButton("📊 Итоги дня", callback_data="summary")]
-        ])
-        await update.message.reply_text("Привет, админ! Выберите действие:", reply_markup=keyboard)
+    user_id = update.effective_user.id
+    username = update.effective_user.username or f"id_{user_id}"
+
+    if user_id == ADMIN_ID:
+        # Постоянное меню для админа (ReplyKeyboard внизу чата)
+        reply_keyboard = [
+            ["🧭 Оптимизация маршрутов", "📊 Итоги дня"],
+            ["📥 Загрузить Excel"]
+        ]
+        markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            f"Привет, админ {username}!\nВыберите действие ниже:",
+            reply_markup=markup
+        )
     else:
+        # Водителю оставляем прежнюю логику (инлайн-кнопка)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
         ])
@@ -870,6 +879,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
+
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на постоянное меню для администратора."""
+    if update.effective_user.id != ADMIN_ID:
+        return  # на всякий случай отсекаем посторонних
+
+    text = (update.message.text or "").strip().lower()
+
+    # Кнопка: Оптимизация маршрутов
+    if "оптимизац" in text:
+        await optimize_and_assign(context.bot, context)
+        await update.message.reply_text("🚀 Оптимизация выполнена. Результаты отправлены.")
+
+    # Кнопка: Итоги дня
+    elif "итог" in text:
+        await daily_summary(update, context)
+
+    # Кнопка: Загрузить Excel (просто подсказка; сам файл ловит handle_file)
+    elif "excel" in text or "загруз" in text:
+        await update.message.reply_text("📂 Пришлите Excel-файл (.xlsx или .xls).")
+
+    else:
+        await update.message.reply_text("Команда из меню не распознана. Тыкните кнопку ниже ещё раз.")
+
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1264,10 +1297,22 @@ if __name__ == "__main__":
         raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
 
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_params))
     app.add_handler(CommandHandler("earnings", earnings))
     app.add_handler(CommandHandler("summary", daily_summary))
+
+    # Кнопки (callback_data)
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Файлы Excel
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    # Меню админа (ДОЛЖНО идти раньше общего текстового)
+    app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), handle_admin_menu))
+
+    # Общий текст: регистрация водителей. ВАЖНО исключить админа
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
+
     app.run_polling()
