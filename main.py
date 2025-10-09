@@ -39,12 +39,6 @@ sheet = client.open(SHEET_NAME).sheet1
 def sync_drivers_from_sheet():
     """
     Читает данные о водителях из листа 'Водители' и синхронизирует с drivers_data.
-    Структура листа:
-      A: Объем (м³)
-      B: Вес (кг)
-      C: Гос. номер
-      D: Принадлежность ('наш' / 'найм')
-    Возвращает словарь drivers_data.
     """
     try:
         ws = client.open(SHEET_NAME).worksheet("Водители")
@@ -54,22 +48,25 @@ def sync_drivers_from_sheet():
 
     records = ws.get_all_records()
     drivers = {}
-    for idx, row in enumerate(records, start=2):  # строка 2, потому что 1 — заголовки
+    for idx, row in enumerate(records, start=2):
         try:
-            vol = float(str(row.get("Объем", "")).replace(",", ".") or 0)
-            wgt = float(str(row.get("Вес", "")).replace(",", ".") or 0)
-            plate = str(row.get("Гос номер", "")).strip()
-            owner = str(row.get("Принадлежность", "")).strip().lower()
+            row_norm = {k.strip().lower(): v for k, v in row.items()}
+            vol = float(str(row_norm.get("объем", row_norm.get("обьем", 0))).replace(",", ".") or 0)
+            wgt = float(str(row_norm.get("вес", 0)).replace(",", ".") or 0)
+            plate = str(row_norm.get("гос номер", "")).strip()
+            owner = str(row_norm.get("принадлежность", "")).strip().lower()
+            tg_id = str(row_norm.get("telegram id", "")).strip()
 
-            if not owner:  # если нет принадлежности — игнорируем
+            if not owner:
                 continue
 
             drivers[idx] = {
                 "volume": vol,
                 "weight": wgt,
                 "car_plate": plate,
-                "owner_type": owner,   # 'наш' или 'найм'
-                "username": f"id_{idx}"  # заглушка (пока не знаем юзернейм)
+                "owner_type": owner,
+                "username": f"id_{idx}",
+                "telegram_id": tg_id
             }
         except Exception as e:
             logger.warning(f"Ошибка чтения водителя из строки {idx}: {e}")
@@ -910,28 +907,29 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        volume_str, weight_str, *rest = [x for x in update.message.text.split(",")]
+        volume_str, weight_str, *rest = [x.strip() for x in update.message.text.split(",")]
         plate_str = rest[0] if rest else ""
         user_id = update.effective_user.id
         username = update.effective_user.username or f"id_{user_id}"
 
-        vol = float(volume_str.strip().replace(",", "."))
-        wgt = float(weight_str.strip().replace(",", "."))
+        vol = float(volume_str.replace(",", "."))
+        wgt = float(weight_str.replace(",", "."))
         plate = plate_str.strip()
 
-        # обновляем RAM
+        # обновляем данные в оперативке
         drivers_data[user_id] = {
             "volume": vol,
             "weight": wgt,
             "username": username,
             "car_plate": plate,
-            "owner_type": ""  # будет заполнено админом вручную в таблице
+            "owner_type": "",
+            "telegram_id": user_id
         }
 
-        # пишем в лист "Водители"
+        # записываем в таблицу
         try:
             ws = client.open(SHEET_NAME).worksheet("Водители")
-            ws.append_row([vol, wgt, plate, ""])  # принадлежность админ поставит вручную
+            ws.append_row([wgt, vol, plate, "", str(user_id)])  # записываем telegram_id в 5-й столбец
         except Exception as e:
             logger.error(f"Не удалось записать водителя в лист 'Водители': {e}")
 
@@ -1074,6 +1072,8 @@ async def optimize_and_assign(bot, context=None):
         context.bot_data["job_info"] = job_info
         context.bot_data["rows"] = rows
         context.bot_data["row_index_by_job_id"] = row_index_by_job_id
+        bot.bot_data.update(context.bot_data)
+
 
     # сообщение админу
     for vid, data in routes_by_vehicle.items():
@@ -1148,7 +1148,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Отложить маршрут ===
     if data.startswith("skip:"):
         vid = int(data.split(":")[1])
-        await query.edit_message_text(f"⏸ Маршрут для водителя {vid} отложен.")
+        # сохраняем отложенный маршрут в bot_data
+        pending = context.bot_data.setdefault("pending_routes", {})
+        routes_by_vehicle = context.bot_data.get("routes_by_vehicle", {})
+        if vid in routes_by_vehicle:
+            pending[vid] = routes_by_vehicle[vid]
+            await query.edit_message_text(f"⏸ Маршрут для водителя {vid} отложен и сохранён.")
+        else:
+            await query.edit_message_text(f"⚠️ Не найден маршрут для {vid}.")
         return
 
     # === Назначение маршрута ===
@@ -1158,68 +1165,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Маршрут назначен водителю {vid}")
         return
 
-    # === Редактирование маршрута (пока простая заглушка) ===
+    # === Редактирование маршрута ===
     if data.startswith("edit:"):
         vid = int(data.split(":")[1])
-        await query.edit_message_text(f"✏️ Редактирование маршрута для водителя {vid} (в разработке)")
+        await start_editing_route(update, context, vid)
         return
 
-    # === Завершение заявок (done/fail) ===
-    try:
-        if data.startswith("done:") or data.startswith("fail:"):
-            row_idx = int(data.split(":")[1])
-            is_done = data.startswith("done:")
-            status_value = "выполнено" if is_done else "не выполнено"
-
-            seg_km = prev_leg_km_by_row.get(row_idx)
-            if seg_km is not None and COL_DISTANCE_N:
-                try:
-                    sheet.update_cell(row_idx, COL_DISTANCE_N, f"{seg_km:.1f}")
-                except Exception as e:
-                    logger.error(f"Не удалось записать сегментный пробег в строку {row_idx}: {e}")
-
-            if COL_STATUS:  sheet.update_cell(row_idx, COL_STATUS, status_value)
-            if COL_UPDATED: sheet.update_cell(row_idx, COL_UPDATED, now_human())
-            if not is_done:
-                if COL_DRIVER: sheet.update_cell(row_idx, COL_DRIVER, "")
-                if COL_ETA:    sheet.update_cell(row_idx, COL_ETA, "")
-
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-
-            await query.message.reply_text(f"✅ Статус обновлён: {status_value.upper()} (строка {row_idx})")
-
-            try:
-                order_no = order_no_from_col_A(row_idx)
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"ℹ️ Заявка №{order_no} ({row_idx}) → {status_value.upper()}"
-                )
-            except Exception as e:
-                logger.error(f"Не удалось уведомить админа об изменении статуса: {e}")
-
-            # === Запись в историю ===
-            try:
-                ws_history = client.open(SHEET_NAME).worksheet("История")
-                ws_history.append_row([
-                    now_human(),                       # дата/время
-                    order_no_from_col_A(row_idx),      # номер заявки
-                    query.from_user.username,          # кто выполнял
-                    status_value,                      # статус
-                    sheet.cell(row_idx, col("Стоимость доставки (для расчёта)")).value or 0
-                ])
-                logger.debug(f"История: записана строка для {row_idx}")
-            except Exception as e:
-                logger.error(f"Не удалось записать историю: {e}")
-
-            return
-    except Exception as e:
-        logger.error(f"Ошибка обработки кнопки {data}: {e}")
-        await query.message.reply_text("⚠️ Не удалось обновить статус. Сообщите админу.")
+    # === Удаление заявки из маршрута ===
+    if data.startswith("remove:"):
+        try:
+            _, vid_str, jid_str = data.split(":")
+            vid, jid = int(vid_str), int(jid_str)
+            routes = context.bot_data.get("routes_by_vehicle", {})
+            if vid not in routes:
+                await query.edit_message_text(f"⚠️ Не найден маршрут {vid}.")
+                return
+            steps = routes[vid]["steps"]
+            routes[vid]["steps"] = [s for s in steps if int(s["job"]) != jid]
+            await query.edit_message_text(f"🗑 Заказ №{jid} убран из маршрута водителя {vid}.")
+            # обновляем данные
+            context.bot_data["routes_by_vehicle"] = routes
+        except Exception as e:
+            logger.error(f"Ошибка удаления заказа: {e}")
+            await query.edit_message_text("⚠️ Не удалось удалить заказ.")
         return
 
+    # === Пересчёт маршрута ===
+    if data.startswith("recalc:"):
+        vid = int(data.split(":")[1])
+        await query.edit_message_text(f"♻️ Пересчёт маршрута {vid} пока не реализован.")
+        return
+
+    # === Отмена редактирования ===
+    if data == "cancel_edit":
+        await query.edit_message_text("↩️ Редактирование отменено.")
+        return
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ===
 routes_by_vehicle = {}   # глобально храним маршруты после оптимизации
@@ -1228,10 +1208,6 @@ row_index_by_job_id = {}
 rows = []
 
 async def send_route_to_driver(bot, vid: int):
-    """
-    Отправляет маршрут конкретному водителю после того,
-    как админ нажал кнопку "Назначить водителю".
-    """
     routes_by_vehicle = bot.bot_data.get("routes_by_vehicle", {})
     job_info = bot.bot_data.get("job_info", {})
 
@@ -1240,10 +1216,27 @@ async def send_route_to_driver(bot, vid: int):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Нет маршрута для водителя {vid}.")
         return
 
-    drv = drivers_data.get(vid, {})
+    # ищем данные о водителе
+    drv = drivers_data.get(vid)
+    tg_id = None
+    if drv and drv.get("telegram_id"):
+        tg_id = int(drv["telegram_id"])
+    else:
+        try:
+            ws = client.open(SHEET_NAME).worksheet("Водители")
+            records = ws.get_all_records()
+            match = next((r for r in records if str(r.get("гос номер","")).strip() == drv.get("car_plate","")), None)
+            if match:
+                tg_id = int(match.get("Telegram ID") or 0)
+        except Exception as e:
+            logger.error(f"Не удалось найти Telegram ID для водителя {vid}: {e}")
+
+    if not tg_id:
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ У водителя {vid} нет Telegram ID.")
+        return
+
     username = drv.get("username", f"id_{vid}")
     job_steps = data["steps"]
-
     total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
     total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
 
@@ -1252,47 +1245,44 @@ async def send_route_to_driver(bot, vid: int):
         jid = int(s["job"])
         info = job_info.get(jid, {})
         eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-        lines.append(
-            f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
-            + (f" (ETA {eta_str})" if eta_str else "")
-        )
+        lines.append(f"• №{info.get('order_no', jid)} — {info.get('addr', '')}" + (f" (ETA {eta_str})" if eta_str else ""))
 
     route_text = f"🧭 Ваш маршрут на сегодня:\n" + ("\n".join(lines) if lines else "Заявок нет")
     if lines:
-        route_text += f"\n\nИтого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг"
+        route_text += f"\n\nИтого: объём {total_vol_m3} м³ / вес {total_wgt_kg} кг"
     route_text += f"\n🛣 Пробег маршрута: ~{data['route_km']:.1f} км"
 
     try:
-        await bot.send_message(chat_id=vid, text=route_text)
-        await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {username} (id={vid}).")
+        await bot.send_message(chat_id=tg_id, text=route_text)
+        await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {username} (id={tg_id}).")
     except Exception as e:
         logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить {username} (id={vid}).")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить маршрут водителю {username}.")
 
 async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
-    """
-    Заготовка: вход в режим редактирования маршрута.
-    Показывает список заказов с кнопками "убрать".
-    """
-    global routes_by_vehicle, job_info
+    """Режим редактирования маршрута: можно убирать заказы из маршрута."""
+    routes_by_vehicle = context.bot_data.get("routes_by_vehicle", {})
+    job_info = context.bot_data.get("job_info", {})
+
     data = routes_by_vehicle.get(vid, {})
     job_steps = data.get("steps", [])
     if not job_steps:
         await update.effective_message.reply_text("⚠️ У этого маршрута нет заказов.")
         return
 
-    # строим кнопки для удаления заказов
     buttons = []
     for s in job_steps:
         jid = int(s["job"])
         order_no = job_info.get(jid, {}).get("order_no", str(jid))
-        buttons.append([InlineKeyboardButton(f"🗑 Убрать заказ №{order_no}", callback_data=f"remove:{vid}:{jid}")])
+        addr = job_info.get(jid, {}).get("addr", "")
+        short_addr = addr.split(",")[0] if addr else ""
+        buttons.append([InlineKeyboardButton(f"🗑 Убрать №{order_no} ({short_addr})", callback_data=f"remove:{vid}:{jid}")])
 
     kb = InlineKeyboardMarkup(buttons + [
         [InlineKeyboardButton("♻️ Пересчитать маршрут", callback_data=f"recalc:{vid}")],
         [InlineKeyboardButton("↩️ Отмена", callback_data="cancel_edit")]
     ])
-    await update.effective_message.reply_text("Выберите заказы для удаления:", reply_markup=kb)
+    await update.effective_message.reply_text("✏️ Выберите заказы, которые нужно убрать:", reply_markup=kb)
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
