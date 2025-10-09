@@ -50,21 +50,24 @@ def sync_drivers_from_sheet():
     drivers = {}
     for idx, row in enumerate(records, start=2):
         try:
+            # нормализуем заголовки
             row_norm = {k.strip().lower(): v for k, v in row.items()}
+
             vol = float(str(row_norm.get("объем", row_norm.get("обьем", 0))).replace(",", ".") or 0)
             wgt = float(str(row_norm.get("вес", 0)).replace(",", ".") or 0)
             plate = str(row_norm.get("гос номер", "")).strip()
             owner = str(row_norm.get("принадлежность", "")).strip().lower()
             tg_id = str(row_norm.get("telegram id", "")).strip()
 
-            if not owner:
+            # если вообще нет госномера — строка мусор
+            if not plate:
                 continue
 
             drivers[idx] = {
                 "volume": vol,
                 "weight": wgt,
                 "car_plate": plate,
-                "owner_type": owner,
+                "owner_type": owner or "не указано",
                 "username": f"id_{idx}",
                 "telegram_id": tg_id
             }
@@ -72,7 +75,7 @@ def sync_drivers_from_sheet():
             logger.warning(f"Ошибка чтения водителя из строки {idx}: {e}")
             continue
 
-    logger.info(f"Синхронизация: найдено водителей {len(drivers)}")
+    logger.info(f"Синхронизация водителей: {len(drivers)} шт. Примеры: {list(drivers.items())[:2]}")
     return drivers
 
 # === ОКРУЖЕНИЕ ===
@@ -1310,3 +1313,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
+
