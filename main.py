@@ -457,7 +457,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
 
     if c_weight:
-        w_series = safe_col(df, c_weight).apply(lambda x: round(parse_num(x, 0.0), 1))
+        w_series = safe_col(df, c_weight).apply(lambda x: int(round(parse_num(x, 0.0))))
     else:
         w_series = pd.Series([0.0] * len(df))
     out["Вес заказа"] = w_series
@@ -467,7 +467,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     out["Телефон"] = safe_col(df, c_phone).astype(str).map(norm_text) if c_phone else ""
 
     if c_volume:
-        v_series = safe_col(df, c_volume).apply(lambda x: round(parse_num(x, 0.0), 2))
+        v_series = safe_col(df, c_volume).apply(lambda x: int(round(parse_num(x, 0.0))))
     else:
         v_series = pd.Series([0.0] * len(df))
     out["Объем заказа"] = v_series
@@ -518,6 +518,10 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         out["Объем заказа"] = out["Объем заказа"].apply(lambda x: round(parse_num(x, 0.0), 2))
         out["Количество товара"] = out["Количество товара"].apply(lambda x: int(parse_num(x, 0)))
         out["Стоимость доставки (для расчёта)"] = out["Стоимость доставки (для расчёта)"].apply(lambda x: round(parse_num(x, 0.0), 2))
+
+        # убираем "мусорные" заявки вроде "доставка товара клиенту"
+    mask = ~out["наименование"].str.lower().str.contains("доставка товара клиенту", na=False)
+    out = out.loc[mask].reset_index(drop=True)
 
     out = out.reset_index(drop=True)
     logger.debug(f"Итог к загрузке: строк {len(out)}; примеры стоимостей: {out['Стоимость доставки (для расчёта)'].head(5).tolist()}")
