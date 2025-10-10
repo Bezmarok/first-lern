@@ -203,13 +203,15 @@ addr_cache = {}
 def geocode_address(address: str):
     """
     Геокодирование адреса через OpenRouteService с кэшированием.
-    Возвращает (lat, lon) — строго в этом порядке.
+    ВОЗВРАЩАЕТ (lon, lat) — строго в этом порядке, как требует ORS.
     """
     if not address:
         return (None, None)
 
+    # чистим индекс и пробелы
     addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
 
+    # проверяем в кэше (ключ — очищенный адрес, значение — (lon, lat))
     if addr in addr_cache:
         logger.debug(f"[CACHE] Геокод найден для '{addr}' -> {addr_cache[addr]}")
         return addr_cache[addr]
@@ -233,14 +235,17 @@ def geocode_address(address: str):
             logger.warning(f"Геокодинг: нет результатов для '{addr}'")
             return (None, None)
 
+        # выбираем ближайший к складу результат
         best = None
         best_dist = float("inf")
+        wh_lat = float(WAREHOUSE_LAT)
+        wh_lon = float(WAREHOUSE_LON)
         for f in feats:
             lon, lat = f["geometry"]["coordinates"]
-            dist = _haversine_km(float(WAREHOUSE_LAT), float(WAREHOUSE_LON), lat, lon)
+            dist = _haversine_km(wh_lat, wh_lon, float(lat), float(lon))
             if dist < best_dist:
                 best_dist = dist
-                best = (lat, lon)  # <── правильный порядок
+                best = (float(lon), float(lat))  # строго (lon, lat)
 
         if best:
             addr_cache[addr] = best
@@ -571,16 +576,76 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте заголовки или структуру таблицы.")
             return
 
-        rows = df_all.values.tolist()
-        sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        # 1) берём заголовки листа и готовим нормализаторы
+        sheet_headers = sheet.row_values(1)
+        sh_norm = [h.strip() for h in sheet_headers]
+        sh_norm_lc = [h.strip().lower() for h in sheet_headers]
+
+        # 2) нормализуем имена колонок df (нижний регистр)
+        df_cols = [c.strip() for c in df_all.columns.astype(str)]
+        df_cols_lc = [c.lower() for c in df_cols]
+
+        # 3) сопоставление “как называется в листе” → “какая колонка у нас в df”
+        # ключевые соответствия по смыслу
+        wanted_map = {
+            "номер заявки": ["номер заявки", "id", "заявка", "номер"],
+            "вес заказа": ["вес заказа", "вес"],
+            "вид перевозки": ["вид перевозки"],
+            "телефон": ["телефон", "телефон клиента"],
+            "объем заказа": ["объем заказа", "обьем заказа", "объем", "обьем", "м3", "м^3"],
+            "адрес доставки": ["адрес доставки", "адрес"],
+            "количество товара": ["количество товара", "количество"],
+            "наименование": ["наименование", "список товаров"],
+            "план время дата": ["план время дата", "дата доставки", "время доставки", "дата", "время"],
+            "стоимость доставки": ["стоимость доставки", "стоимость доставки (для расчёта)"]
+        }
+
+        def find_df_col(aliases: list[str]) -> str | None:
+            for a in aliases:
+                a_lc = a.lower()
+                for i, c in enumerate(df_cols_lc):
+                    if a_lc == c or a_lc in c:
+                        return df_cols[i]
+            return None
+
+        # 4) для каждого заголовка листа вычисляем, из какой df-колонки брать данные
+        col_mapping = {}
+        for i, sh_name_lc in enumerate(sh_norm_lc):
+            # ищем соответствие по словарю смыслов
+            match_df_col = None
+            for sense_name, aliases in wanted_map.items():
+                if sense_name in sh_name_lc:
+                    match_df_col = find_df_col(aliases)
+                    break
+            # если совпадений нет, оставим None (будет пустая ячейка)
+            col_mapping[i] = match_df_col
+
+        # 5) собираем строки для append_rows ровно в порядке листа
+        aligned_rows = []
+        for _, row in df_all.iterrows():
+            values = [""] * len(sh_norm)
+            for i in range(len(sh_norm)):
+                df_col = col_mapping[i]
+                if df_col is None:
+                    continue
+                val = row.get(df_col, "")
+                # приятная чистка строк
+                if isinstance(val, str):
+                    val = val.strip()
+                values[i] = val
+            aligned_rows.append(values)
+
+        # пишем в лист
+        sheet.append_rows(aligned_rows, value_input_option="USER_ENTERED")
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🧭 Распределить маршруты", callback_data="optimize")]
         ])
         await update.message.reply_text(
-            f"✅ Файл обработан. Добавлено заявок: {len(rows)}.\nНажмите кнопку ниже:",
+            f"✅ Файл обработан. Добавлено заявок: {len(aligned_rows)}.\nНажмите кнопку ниже:",
             reply_markup=keyboard
         )
+
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
@@ -1031,18 +1096,12 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
-    """
-    Строит маршруты и шлёт администратору сводки.
-    Больше НЕ зависит от drivers_data. Берём водителей из листа «Водители».
-    Возвращает True при успехе, False при любой проблеме.
-    """
     try:
         rows = sheet.get_all_records()
     except Exception as e:
         await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Не удалось прочитать лист заявок: {e}")
         return False
 
-    # Берём водителей ТОЛЬКО из листа «Водители»
     vehicles = build_vehicles_from_drivers()
     if not vehicles:
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей в листе «Водители».")
@@ -1079,7 +1138,6 @@ async def optimize_and_assign(bot, context=None):
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
-    # Сохраняем в bot_data
     if context:
         context.bot_data["routes_by_vehicle"] = routes_by_vehicle
         context.bot_data["job_info"] = job_info
@@ -1087,7 +1145,16 @@ async def optimize_and_assign(bot, context=None):
         context.bot_data["row_index_by_job_id"] = row_index_by_job_id
         bot.bot_data.update(context.bot_data)
 
-    # Сообщение админу по каждому водителю
+    def _price_from_row(r: dict) -> float:
+        # поддерживаем оба названия
+        for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
+            if key in r and r[key] not in (None, ""):
+                try:
+                    return float(str(r[key]).replace(",", "."))
+                except Exception:
+                    pass
+        return 0.0
+
     for vid, data in routes_by_vehicle.items():
         drv = next((d for d in vehicles if d["id"] == vid), None)
         if not drv:
@@ -1106,8 +1173,8 @@ async def optimize_and_assign(bot, context=None):
             price_val = 0.0
             try:
                 row_idx = row_index_by_job_id.get(jid)
-                if row_idx and "Стоимость доставки (для расчёта)" in rows[row_idx - 2]:
-                    price_val = float(rows[row_idx - 2].get("Стоимость доставки (для расчёта)", 0) or 0)
+                if row_idx:
+                    price_val = _price_from_row(rows[row_idx - 2])
             except Exception:
                 price_val = 0.0
             total_price += price_val
@@ -1131,7 +1198,6 @@ async def optimize_and_assign(bot, context=None):
         ])
         await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
 
-    # Если что-то осталось нераспределённым — тоже скажем
     if unassigned_ids:
         await bot.send_message(chat_id=ADMIN_ID,
                                text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
@@ -1146,9 +1212,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Оптимизация маршрутов ===
     if data in ("optimize", "optimize_again"):
-        await optimize_and_assign(context.bot, context)
+        ok = await optimize_and_assign(context.bot, context)
         try:
-            await query.edit_message_text("🔄 Маршруты построены и разосланы админу!")
+            if ok:
+                await query.edit_message_text("🔄 Маршруты построены и разосланы админу!")
+            else:
+                await query.edit_message_text("⚠️ Оптимизация не выполнена. См. сообщения выше.")
         except Exception:
             pass
         return
@@ -1166,7 +1235,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Отложить маршрут ===
     if data.startswith("skip:"):
         vid = int(data.split(":")[1])
-        # сохраняем отложенный маршрут в bot_data
         pending = context.bot_data.setdefault("pending_routes", {})
         routes_by_vehicle = context.bot_data.get("routes_by_vehicle", {})
         if vid in routes_by_vehicle:
@@ -1201,7 +1269,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             steps = routes[vid]["steps"]
             routes[vid]["steps"] = [s for s in steps if int(s["job"]) != jid]
             await query.edit_message_text(f"🗑 Заказ №{jid} убран из маршрута водителя {vid}.")
-            # обновляем данные
             context.bot_data["routes_by_vehicle"] = routes
         except Exception as e:
             logger.error(f"Ошибка удаления заказа: {e}")
