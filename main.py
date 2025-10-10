@@ -654,13 +654,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_jobs_from_sheet(rows, start_row_idx=2):
     """
     Строит массив jobs для ORS из Google Sheets.
-    Объём — м³ (float, округление до 2 знаков), вес — кг (float, до 1 знака).
+    Объём — м³ (float), вес — кг (float) внутри кода,
+    НО в ORS уходит в целых числах с масштабами VOLUME_SCALE/WEIGHT_SCALE.
     Возвращает: jobs, row_index_by_job_id, coords_cache, job_info
     """
     def norm_key(s: str) -> str:
         return re.sub(r"\s+", "", str(s).lower().replace("ё", "е"))
 
-    # Алиасы, чтобы не промахнуться по заголовкам
     aliases = {
         "status":  ["статус"],
         "driver":  ["водитель"],
@@ -672,7 +672,6 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         "qty":     ["количествотовара", "количество"]
     }
 
-    # Предпостроим отображение нормализованных ключей строки -> исходный ключ
     def pick_key(row: dict, keys: list[str]) -> str | None:
         nk = {norm_key(k): k for k in row.keys()}
         for wanted in keys:
@@ -686,11 +685,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             return float(default)
         if isinstance(val, (int, float)):
             return float(val)
-        s = str(val).strip()
-        # убираем лишние символы
-        s = s.replace(" ", "").replace("\u00a0", "")
+        s = str(val).strip().replace(" ", "").replace("\u00a0", "")
         s = s.replace(",", ".")
-        # отбрасываем всё, что после второго числа
         m = re.match(r"^-?\d+(\.\d+)?", s)
         try:
             return float(m.group(0)) if m else float(default)
@@ -701,17 +697,13 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         if not addr:
             return ""
         s = str(addr)
-        # срезаем индекс в начале
         s = re.sub(r"^\s*\d{5,6}\s*,\s*", "", s)
-        # убираем повторы города типа "Санкт-Петербург, Санкт-Петербург"
         parts = [p.strip() for p in s.split(",") if p.strip()]
         seen = []
         for p in parts:
             if not seen or norm_key(p) != norm_key(seen[-1]):
                 seen.append(p)
         s = ", ".join(seen)
-
-        # удаляем кв/офис/пом/лит/строение — для геокода только улица и дом
         s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", s, flags=re.IGNORECASE)
         s = re.sub(r"\s{2,}", " ", s).strip(",; ").strip()
         return s
@@ -725,7 +717,6 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         if not row or not isinstance(row, dict):
             continue
 
-        # Подхватываем реальные ключи из строки
         k_status  = pick_key(row, aliases["status"])
         k_driver  = pick_key(row, aliases["driver"])
         k_addr    = pick_key(row, aliases["address"])
@@ -733,39 +724,32 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         k_plan    = pick_key(row, aliases["plan_dt"])
         k_vol     = pick_key(row, aliases["volume"])
         k_wgt     = pick_key(row, aliases["weight"])
-        # qty нам не нужен для расчётов, но пригодится для отладки
         k_qty     = pick_key(row, aliases["qty"])
 
         status = str(row.get(k_status, "")).strip().lower() if k_status else ""
         driver_cell = str(row.get(k_driver, "")).strip() if k_driver else ""
         addr_raw = str(row.get(k_addr, "")).strip() if k_addr else ""
 
-        # Пропускаем уже назначенные/выполненные/без адреса
+        # пропускаем уже занятые/готовые/без адреса
         if not addr_raw or status in ("выполняется", "выполнено", "не выполнено") or driver_cell:
             continue
 
         addr_for_geo = clean_address_for_geocode(addr_raw)
-        lon, lat = geocode_address(addr_for_geo)
+        lon, lat = geocode_address(addr_for_geo)  # <- (lon, lat)
         if not (lon and lat):
             logger.warning(f"Пропущена заявка {idx} — не удалось геокодить: {addr_for_geo}")
             continue
-
         coords_cache[idx] = (float(lon), float(lat))
 
-        # Время окна
         tw = parse_time_window(row.get(k_plan)) if k_plan else None
 
-        # Сырые значения
         raw_vol = row.get(k_vol) if k_vol else None
         raw_wgt = row.get(k_wgt) if k_wgt else None
         raw_qty = row.get(k_qty) if k_qty else None
 
-        # Нормализация чисел
         vol_m3 = round(max(0.0, as_float(raw_vol, 0.0)), 2)
         wgt_kg = round(max(0.0, as_float(raw_wgt, 0.0)), 1)
 
-        # Защитные ходы против типичных косяков:
-        # 1) Если «объём» вдруг равен целому и при этом совпадает с «кол-вом товара» — это почти наверняка подмена столбца.
         try:
             qty_val = as_float(raw_qty, None) if raw_qty is not None else None
             if qty_val is not None and abs(vol_m3 - qty_val) < 1e-9 and vol_m3 > 0 and as_float(raw_vol, None) is None:
@@ -774,19 +758,24 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         except Exception:
             pass
 
-        # id и номер заявки
         try:
             order_no_raw = str(row.get(k_order, "")).strip() if k_order else ""
         except Exception:
             order_no_raw = ""
         order_no = order_no_raw if order_no_raw else order_no_from_col_A(idx)
 
+        # ВАЖНО: ORS требует целые числа в amount
+        amount_int = [
+            int(round(vol_m3 * VOLUME_SCALE)),  # объём
+            int(round(wgt_kg * WEIGHT_SCALE))   # вес
+        ]
+
         job_id = idx
         job = {
             "id": job_id,
-            "location": [float(lon), float(lat)],
+            "location": [float(lon), float(lat)],  # (lon, lat)
             "service": int(DEFAULT_SERVICE_MIN * 60),
-            "amount": [vol_m3, wgt_kg],
+            "amount": amount_int,
             "description": str(order_no),
         }
         if tw:
@@ -804,14 +793,14 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             "raw": {"vol": raw_vol, "wgt": raw_wgt, "qty": raw_qty}
         }
 
-        logger.debug(f"[JOB row {idx}] order='{order_no}' raw_vol='{raw_vol}' -> vol={vol_m3:.2f} м³; raw_wgt='{raw_wgt}' -> w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}]")
+        logger.debug(f"[JOB row {idx}] order='{order_no}' raw_vol='{raw_vol}' -> vol={vol_m3:.2f} м³; raw_wgt='{raw_wgt}' -> w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}] amount={amount_int}")
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
 def build_vehicles_from_drivers():
     """
     Собирает список машин для ORS.
-    Вместимость в м³ и кг (те же единицы, что и у jobs).
+    В capacity передаём ТОЛЬКО целые числа с масштабами VOLUME_SCALE/WEIGHT_SCALE.
     Источник данных — лист "Водители" в Google Sheets.
     """
     vehicles = []
@@ -822,7 +811,6 @@ def build_vehicles_from_drivers():
         logger.error("⚠️ Неверные координаты склада. Проверь WAREHOUSE_LAT/LON.")
         return vehicles
 
-    # подтягиваем водителей из листа
     drivers = sync_drivers_from_sheet()
 
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -834,21 +822,25 @@ def build_vehicles_from_drivers():
             vol_cap_m3 = float(drv["volume"])
             wgt_cap_kg = float(drv["weight"])
             owner_type = drv.get("owner_type", "").strip().lower()
-
             if not owner_type:
                 logger.info(f"Водитель {user_id} пропущен (нет принадлежности).")
                 continue
 
+            capacity_int = [
+                int(round(vol_cap_m3 * VOLUME_SCALE)),
+                int(round(wgt_cap_kg * WEIGHT_SCALE))
+            ]
+
             vehicle = {
                 "id": int(user_id),
                 "profile": "driving-car",
-                "start": [s_lon, s_lat],
-                "end": [s_lon, s_lat],
+                "start": [s_lon, s_lat],   # (lon, lat)
+                "end":   [s_lon, s_lat],   # (lon, lat)
                 "time_window": [to_unix(start), to_unix(end)],
-                "capacity": [vol_cap_m3, wgt_cap_kg],
+                "capacity": capacity_int,
                 "description": drv.get("username", f"id_{user_id}"),
                 "car_plate": drv.get("car_plate", ""),
-                "owner_type": owner_type  # <── теперь хранится здесь
+                "owner_type": owner_type
             }
             vehicles.append(vehicle)
         except Exception as e:
@@ -860,6 +852,7 @@ def build_vehicles_from_drivers():
             logger.error(f"🚨 В vehicles затесался мусор: {v}")
             raise ValueError("Сломанный объект в списке машин.")
 
+    logger.info(f"Собрано машин: {len(vehicles)}; пример capacity: {vehicles[0]['capacity'] if vehicles else '—'} (scale V={VOLUME_SCALE}, W={WEIGHT_SCALE})")
     return vehicles
 
 def reason_for_unassigned(job, vehicles):
@@ -889,14 +882,30 @@ def reason_for_unassigned(job, vehicles):
 
 def ors_optimize(jobs, vehicles):
     """
-    Отправляет корректный JSON в ORS. Используем json=payload,
-    чтобы не словить «кривую» сериализацию и случайные мусорные куски.
+    Отправляет корректный JSON в ORS. Перед отправкой валидируем,
+    что amount/capacity состоят из ЦЕЛЫХ чисел.
     """
+    # валидация целочисленности
+    for j in jobs:
+        if not isinstance(j.get("amount"), list) or len(j["amount"]) != 2:
+            raise ValueError(f"Job {j.get('id')} имеет некорректный amount={j.get('amount')}")
+        if any((not isinstance(x, int)) for x in j["amount"]):
+            raise ValueError(f"Job {j.get('id')} amount должен быть целым: {j['amount']}")
+        if not isinstance(j.get("location"), list) or len(j["location"]) != 2:
+            raise ValueError(f"Job {j.get('id')} некорректная location={j.get('location')}")
+
+    for v in vehicles:
+        cap = v.get("capacity")
+        if not isinstance(cap, list) or len(cap) != 2 or any((not isinstance(x, int)) for x in cap):
+            raise ValueError(f"Vehicle {v.get('id')} capacity должен быть целым: {cap}")
+        loc_ok = isinstance(v.get("start"), list) and isinstance(v.get("end"), list) and len(v["start"]) == 2 and len(v["end"]) == 2
+        if not loc_ok:
+            raise ValueError(f"Vehicle {v.get('id')} некорректные start/end")
+
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
 
-    # компактный лог + полный для отладки
     try:
         sample = {
             "jobs": [{k: j[k] for k in ("id", "location", "amount")} for j in jobs[:5]],
@@ -905,9 +914,9 @@ def ors_optimize(jobs, vehicles):
         logger.debug("📤 ORS payload (sample): %s", json.dumps(sample, ensure_ascii=False))
     except Exception:
         pass
+
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
-    # важно: именно json=payload, не data=json.dumps(...)
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     return r.json()
