@@ -203,15 +203,13 @@ addr_cache = {}
 def geocode_address(address: str):
     """
     Геокодирование адреса через OpenRouteService с кэшированием.
-    Возвращает (lon, lat) или (None, None).
+    Возвращает (lat, lon) — строго в этом порядке.
     """
     if not address:
         return (None, None)
 
-    # чистим индекс и пробелы
     addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
 
-    # проверяем в кэше
     if addr in addr_cache:
         logger.debug(f"[CACHE] Геокод найден для '{addr}' -> {addr_cache[addr]}")
         return addr_cache[addr]
@@ -235,15 +233,14 @@ def geocode_address(address: str):
             logger.warning(f"Геокодинг: нет результатов для '{addr}'")
             return (None, None)
 
-        # выбираем ближайший к складу результат
         best = None
-        best_dist = 999999
+        best_dist = float("inf")
         for f in feats:
             lon, lat = f["geometry"]["coordinates"]
             dist = _haversine_km(float(WAREHOUSE_LAT), float(WAREHOUSE_LON), lat, lon)
             if dist < best_dist:
                 best_dist = dist
-                best = (float(lon), float(lat))
+                best = (lat, lon)  # <── правильный порядок
 
         if best:
             addr_cache[addr] = best
@@ -546,26 +543,32 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         frames = []
+        errors = []
         for df_raw in read_excel_flex(tmp_path, document.file_name):
             try:
                 df_ready = build_import_dataframe(df_raw)
                 if not df_ready.empty:
-                    # округление здесь, чтобы дальше всё шло чистое
                     if "Вес заказа" in df_ready.columns:
                         df_ready["Вес заказа"] = pd.to_numeric(df_ready["Вес заказа"], errors="coerce").fillna(0).round(1)
                     if "Объем заказа" in df_ready.columns:
                         df_ready["Объем заказа"] = pd.to_numeric(df_ready["Объем заказа"], errors="coerce").fillna(0).round(2)
                     frames.append(df_ready)
+                else:
+                    errors.append("Пустой лист или не найдены номера заявок.")
             except Exception as e:
                 logger.warning(f"Лист пропущен: {e}")
+                errors.append(f"Ошибка на листе: {str(e)}")
 
         if not frames:
-            await update.message.reply_text("⚠️ В файле не нашёлся ни один номер заявки. Проверьте заголовки/лист.")
+            msg = "⚠️ В файле не нашёлся ни один номер заявки.\n"
+            if errors:
+                msg += "\n".join(f"• {e}" for e in errors[:5])
+            await update.message.reply_text(msg)
             return
 
         df_all = pd.concat(frames, ignore_index=True)
         if df_all.empty:
-            await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте формат.")
+            await update.message.reply_text("⚠️ После обработки файл пуст. Проверьте заголовки или структуру таблицы.")
             return
 
         rows = df_all.values.tolist()
@@ -580,7 +583,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
-        await update.message.reply_text("⚠️ Ошибка обработки файла. Проверьте формат/заголовки.")
+        await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
 
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
@@ -1313,4 +1316,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
