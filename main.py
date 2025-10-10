@@ -890,26 +890,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нажатий на постоянное меню для администратора."""
     if update.effective_user.id != ADMIN_ID:
-        return  # на всякий случай отсекаем посторонних
+        return
 
     text = (update.message.text or "").strip().lower()
 
-    # Кнопка: Оптимизация маршрутов
     if "оптимизац" in text:
-        await optimize_and_assign(context.bot, context)
-        await update.message.reply_text("🚀 Оптимизация выполнена. Результаты отправлены.")
+        ok = await optimize_and_assign(context.bot, context)
+        if ok:
+            await update.message.reply_text("🚀 Оптимизация выполнена. Результаты отправлены.")
+        else:
+            await update.message.reply_text("⚠️ Оптимизация не выполнена. См. сообщение(я) выше.")
+        return
 
-    # Кнопка: Итоги дня
     elif "итог" in text:
         await daily_summary(update, context)
+        return
 
-    # Кнопка: Загрузить Excel (просто подсказка; сам файл ловит handle_file)
     elif "excel" in text or "загруз" in text:
         await update.message.reply_text("📂 Пришлите Excel-файл (.xlsx или .xls).")
+        return
 
-    else:
-        await update.message.reply_text("Команда из меню не распознана. Тыкните кнопку ниже ещё раз.")
-
+    await update.message.reply_text("Команда из меню не распознана. Тыкните кнопку ниже ещё раз.")
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1030,34 +1031,40 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
-    rows = sheet.get_all_records()
+    """
+    Строит маршруты и шлёт администратору сводки.
+    Больше НЕ зависит от drivers_data. Берём водителей из листа «Водители».
+    Возвращает True при успехе, False при любой проблеме.
+    """
+    try:
+        rows = sheet.get_all_records()
+    except Exception as e:
+        await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Не удалось прочитать лист заявок: {e}")
+        return False
 
-    if not drivers_data:
-        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет данных от водителей.")
-        return
+    # Берём водителей ТОЛЬКО из листа «Водители»
+    vehicles = build_vehicles_from_drivers()
+    if not vehicles:
+        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей в листе «Водители».")
+        return False
 
     jobs, row_index_by_job_id, coords_cache, job_info = build_jobs_from_sheet(rows)
     if not jobs:
-        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации.")
-        return
-
-    vehicles = build_vehicles_from_drivers()
-    if not vehicles:
-        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей.")
-        return
+        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации (все назначены/выполнены или без адреса).")
+        return False
 
     if len(jobs) > 50 or len(vehicles) > 3:
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3)."
         )
-        return
+        return False
 
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
         await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка оптимизации: {e}")
-        return
+        return False
 
     routes = solution.get("routes", [])
     unassigned_raw = solution.get("unassigned", [])
@@ -1072,7 +1079,7 @@ async def optimize_and_assign(bot, context=None):
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
-    # сохраняем в bot_data
+    # Сохраняем в bot_data
     if context:
         context.bot_data["routes_by_vehicle"] = routes_by_vehicle
         context.bot_data["job_info"] = job_info
@@ -1080,8 +1087,7 @@ async def optimize_and_assign(bot, context=None):
         context.bot_data["row_index_by_job_id"] = row_index_by_job_id
         bot.bot_data.update(context.bot_data)
 
-
-    # сообщение админу
+    # Сообщение админу по каждому водителю
     for vid, data in routes_by_vehicle.items():
         drv = next((d for d in vehicles if d["id"] == vid), None)
         if not drv:
@@ -1100,8 +1106,8 @@ async def optimize_and_assign(bot, context=None):
             price_val = 0.0
             try:
                 row_idx = row_index_by_job_id.get(jid)
-                if row_idx and "Стоимость доставки (для расчёта)" in rows[row_idx-2]:
-                    price_val = float(rows[row_idx-2].get("Стоимость доставки (для расчёта)", 0) or 0)
+                if row_idx and "Стоимость доставки (для расчёта)" in rows[row_idx - 2]:
+                    price_val = float(rows[row_idx - 2].get("Стоимость доставки (для расчёта)", 0) or 0)
             except Exception:
                 price_val = 0.0
             total_price += price_val
@@ -1123,8 +1129,14 @@ async def optimize_and_assign(bot, context=None):
             [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
             [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
         ])
-
         await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
+
+    # Если что-то осталось нераспределённым — тоже скажем
+    if unassigned_ids:
+        await bot.send_message(chat_id=ADMIN_ID,
+                               text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
+                                    f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})")
+    return True
 
 # === ОБРАБОТЧИК КНОПОК ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1214,6 +1226,11 @@ row_index_by_job_id = {}
 rows = []
 
 async def send_route_to_driver(bot, vid: int):
+    """
+    Отправляет маршрут водителю с id == vid.
+    vid здесь — это тот самый id, который мы присвоили vehicle (номер строки 'Водители').
+    Telegram ID берём из листа «Водители» по этой строке.
+    """
     routes_by_vehicle = bot.bot_data.get("routes_by_vehicle", {})
     job_info = bot.bot_data.get("job_info", {})
 
@@ -1222,26 +1239,31 @@ async def send_route_to_driver(bot, vid: int):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Нет маршрута для водителя {vid}.")
         return
 
-    # ищем данные о водителе
-    drv = drivers_data.get(vid)
     tg_id = None
-    if drv and drv.get("telegram_id"):
-        tg_id = int(drv["telegram_id"])
-    else:
-        try:
-            ws = client.open(SHEET_NAME).worksheet("Водители")
-            records = ws.get_all_records()
-            match = next((r for r in records if str(r.get("гос номер","")).strip() == drv.get("car_plate","")), None)
-            if match:
-                tg_id = int(match.get("Telegram ID") or 0)
-        except Exception as e:
-            logger.error(f"Не удалось найти Telegram ID для водителя {vid}: {e}")
+    username = f"id_{vid}"
+    car_plate = ""
+
+    try:
+        ws = client.open(SHEET_NAME).worksheet("Водители")
+        # vid — это индекс строки в листе, с которого мы строили vehicle
+        headers = [h.strip().lower() for h in ws.row_values(1)]
+        recs = ws.get_all_records()
+        if 0 <= (vid - 2) < len(recs):
+            row = recs[vid - 2]  # get_all_records начинается со строки 2
+            # гибкий доступ к ключам
+            low = {k.strip().lower(): v for k, v in row.items()}
+            tg_id = low.get("telegram id") or low.get("telegramid") or low.get("телеграм id") or low.get("телеграм")
+            car_plate = low.get("гос номер", "") or low.get("госномер", "")
+            username = f"{low.get('гос номер', '') or 'id'}_{vid}"
+            if tg_id:
+                tg_id = int(str(tg_id).strip())
+    except Exception as e:
+        logger.error(f"Не удалось прочитать Telegram ID для водителя {vid}: {e}")
 
     if not tg_id:
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ У водителя {vid} нет Telegram ID.")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ У водителя {vid} нет Telegram ID в листе «Водители».")
         return
 
-    username = drv.get("username", f"id_{vid}")
     job_steps = data["steps"]
     total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
     total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
