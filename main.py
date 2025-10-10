@@ -1105,6 +1105,11 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
+    """
+    Строит маршруты и шлёт администратору сводки.
+    НЕ обрубает выполнение по количеству машин/заявок.
+    Возвращает True при успехе, False при любой проблеме.
+    """
     try:
         rows = sheet.get_all_records()
     except Exception as e:
@@ -1116,18 +1121,26 @@ async def optimize_and_assign(bot, context=None):
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет водителей в листе «Водители».")
         return False
 
-    jobs, row_index_by_job_id, coords_cache, job_info = build_jobs_from_sheet(rows)
+    try:
+        jobs, row_index_by_job_id, coords_cache, job_info = build_jobs_from_sheet(rows)
+    except Exception as e:
+        await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка подготовки заявок: {e}")
+        return False
+
     if not jobs:
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации (все назначены/выполнены или без адреса).")
         return False
 
-    if len(jobs) > 50 or len(vehicles) > 3:
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"⚠️ Лимит ORS: jobs={len(jobs)} (≤50), vehicles={len(vehicles)} (≤3)."
-        )
-        return False
+    # Мягкое предупреждение, но без остановки
+    warn_msgs = []
+    if len(jobs) > 200:
+        warn_msgs.append(f"много заявок: {len(jobs)}")
+    if len(vehicles) > 20:
+        warn_msgs.append(f"много машин: {len(vehicles)}")
+    if warn_msgs:
+        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Внимание: " + ", ".join(warn_msgs) + ". Попробую посчитать.")
 
+    # Сама оптимизация
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
@@ -1147,6 +1160,7 @@ async def optimize_and_assign(bot, context=None):
     for v in vehicles:
         routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
 
+    # Сохраняем в bot_data для дальнейших кнопок
     if context:
         context.bot_data["routes_by_vehicle"] = routes_by_vehicle
         context.bot_data["job_info"] = job_info
@@ -1154,8 +1168,8 @@ async def optimize_and_assign(bot, context=None):
         context.bot_data["row_index_by_job_id"] = row_index_by_job_id
         bot.bot_data.update(context.bot_data)
 
+    # Подсчёт цены из строки (поддержка двух названий колонки)
     def _price_from_row(r: dict) -> float:
-        # поддерживаем оба названия
         for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
             if key in r and r[key] not in (None, ""):
                 try:
@@ -1164,6 +1178,7 @@ async def optimize_and_assign(bot, context=None):
                     pass
         return 0.0
 
+    # Сообщение админу по каждому водителю
     for vid, data in routes_by_vehicle.items():
         drv = next((d for d in vehicles if d["id"] == vid), None)
         if not drv:
@@ -1414,3 +1429,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
+
