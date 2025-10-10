@@ -1133,10 +1133,8 @@ async def optimize_and_assign(bot, context=None):
 
     # Мягкие предупреждения, но без остановки
     warn_msgs = []
-    if len(jobs) > 200:
-        warn_msgs.append(f"много заявок: {len(jobs)}")
-    if len(vehicles) > 20:
-        warn_msgs.append(f"много машин: {len(vehicles)}")
+    if len(jobs) > 200:  warn_msgs.append(f"много заявок: {len(jobs)}")
+    if len(vehicles) > 20: warn_msgs.append(f"много машин: {len(vehicles)}")
     if warn_msgs:
         await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Внимание: " + ", ".join(warn_msgs) + ". Считаю.")
 
@@ -1167,6 +1165,8 @@ async def optimize_and_assign(bot, context=None):
         store["job_info"] = job_info
         store["rows"] = rows
         store["row_index_by_job_id"] = row_index_by_job_id
+        store["vehicles"] = {int(v["id"]): v for v in vehicles}
+        store["coords_cache"] = coords_cache
 
     # Цена из строки (поддержка двух возможных заголовков)
     def _price_from_row(r: dict) -> float:
@@ -1177,6 +1177,57 @@ async def optimize_and_assign(bot, context=None):
                 except Exception:
                     pass
         return 0.0
+
+    # Сообщение админу по каждому водителю
+    for vid, data in routes_by_vehicle.items():
+        drv = next((d for d in vehicles if d["id"] == vid), None)
+        if not drv:
+            continue
+
+        job_steps = data["steps"]
+        total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
+        total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
+
+        total_price = 0.0
+        lines = []
+        for s in job_steps:
+            jid = int(s["job"])
+            info = job_info.get(jid, {})
+            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+            price_val = 0.0
+            try:
+                row_idx = context.application.bot_data["row_index_by_job_id"].get(jid)
+                if row_idx:
+                    price_val = _price_from_row(rows[row_idx - 2])
+            except Exception:
+                price_val = 0.0
+            total_price += price_val
+            lines.append(
+                f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
+                + (f" (ETA {eta_str})" if eta_str else "")
+                + (f" | {price_val:.2f} ₽" if price_val else "")
+            )
+
+        header = f"{drv.get('description','')}" + (f" | {drv.get('car_plate','')}" if drv.get("car_plate") else "")
+        route_text  = f"🚚 Маршрут для {header}\n"
+        route_text += f"Заявок: {len(job_steps)}\n"
+        route_text += f"Итого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг\n"
+        route_text += f"Пробег: ~{data['route_km']:.1f} км\n"
+        route_text += f"Сумма заказов: {total_price:.2f} ₽\n\n"
+        route_text += ("\n".join(lines) if lines else "Заявок нет")
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Назначить {header}", callback_data=f"assign:{vid}")],
+            [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
+            [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
+        ])
+        await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
+
+    if unassigned_ids:
+        await bot.send_message(chat_id=ADMIN_ID,
+            text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
+                 f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})")
+    return True
 
     # Сообщение админу по каждому водителю
     for vid, data in routes_by_vehicle.items():
@@ -1234,6 +1285,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
+    store = context.application.bot_data
+
     # === Оптимизация маршрутов ===
     if data in ("optimize", "optimize_again"):
         ok = await optimize_and_assign(context.bot, context)
@@ -1259,8 +1312,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Отложить маршрут ===
     if data.startswith("skip:"):
         vid = int(data.split(":")[1])
-        pending = context.application.bot_data.setdefault("pending_routes", {})
-        routes_by_vehicle = context.application.bot_data.get("routes_by_vehicle", {})
+        pending = store.setdefault("pending_routes", {})
+        routes_by_vehicle = store.get("routes_by_vehicle", {})
         if vid in routes_by_vehicle:
             pending[vid] = routes_by_vehicle[vid]
             await query.edit_message_text(f"⏸ Маршрут для водителя {vid} отложен и сохранён.")
@@ -1271,8 +1324,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Назначение маршрута ===
     if data.startswith("assign:"):
         vid = int(data.split(":")[1])
+        drv = store.get("vehicles", {}).get(vid, {"description": f"id_{vid}"})
         await send_route_to_driver(context, vid)
-        await query.edit_message_text(f"✅ Маршрут назначен водителю {vid}")
+        await query.edit_message_text(f"✅ Маршрут назначен: {drv.get('description','')} {drv.get('car_plate','')}")
         return
 
     # === Редактирование маршрута ===
@@ -1281,33 +1335,113 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_editing_route(update, context, vid)
         return
 
-    # === Удаление заявки из маршрута ===
+    # === Удаление заявки из маршрута с пересборкой текста ===
     if data.startswith("remove:"):
         try:
             _, vid_str, jid_str = data.split(":")
             vid, jid = int(vid_str), int(jid_str)
-            routes = context.application.bot_data.get("routes_by_vehicle", {})
+            routes = store.get("routes_by_vehicle", {})
+            job_info = store.get("job_info", {})
+            vehicles = store.get("vehicles", {})
+            rows = store.get("rows", [])
             if vid not in routes:
                 await query.edit_message_text(f"⚠️ Не найден маршрут {vid}.")
                 return
+            # убираем шаг
             steps = routes[vid]["steps"]
             routes[vid]["steps"] = [s for s in steps if int(s["job"]) != jid]
-            await query.edit_message_text(f"🗑 Заказ №{jid} убран из маршрута водителя {vid}.")
-            context.application.bot_data["routes_by_vehicle"] = routes
+            store["routes_by_vehicle"] = routes
+
+            # пересчитываем итоги
+            job_steps = routes[vid]["steps"]
+            total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
+            total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
+            # цену считаем из rows (без реоптимизации пути)
+            def _price_from_row(r: dict) -> float:
+                for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
+                    if key in r and r[key] not in (None, ""):
+                        try:
+                            return float(str(r[key]).replace(",", "."))
+                        except Exception:
+                            pass
+                return 0.0
+            total_price = 0.0
+            lines = []
+            for s in job_steps:
+                sjid = int(s["job"])
+                info = job_info.get(sjid, {})
+                eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+                price_val = 0.0
+                row_idx = store.get("row_index_by_job_id", {}).get(sjid)
+                if row_idx:
+                    try:
+                        price_val = _price_from_row(rows[row_idx-2])
+                    except Exception:
+                        price_val = 0.0
+                total_price += price_val
+                lines.append(f"• №{info.get('order_no', sjid)} — {info.get('addr','')}" + (f" (ETA {eta_str})" if eta_str else "") + (f" | {price_val:.2f} ₽" if price_val else ""))
+            drv = vehicles.get(vid, {"description": f"id_{vid}"})
+            header = f"{drv.get('description','')}" + (f" | {drv.get('car_plate','')}" if drv.get("car_plate") else "")
+            route_text  = f"🚚 Маршрут для {header}\n"
+            route_text += f"Заявок: {len(job_steps)}\n"
+            route_text += f"Итого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг\n"
+            route_text += f"Пробег: ~{routes[vid]['route_km']:.1f} км\n"
+            route_text += f"Сумма заказов: {total_price:.2f} ₽\n\n"
+            route_text += ("\n".join(lines) if lines else "Заявок нет")
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Назначить {header}", callback_data=f"assign:{vid}")],
+                [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
+                [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
+            ])
+            await query.edit_message_text(route_text, reply_markup=kb)
         except Exception as e:
             logger.error(f"Ошибка удаления заказа: {e}")
             await query.edit_message_text("⚠️ Не удалось удалить заказ.")
         return
 
-    # === Пересчёт маршрута ===
+    # === Пересчёт маршрута (плейсхолдер) ===
     if data.startswith("recalc:"):
         vid = int(data.split(":")[1])
-        await query.edit_message_text(f"♻️ Пересчёт маршрута {vid} пока не реализован.")
+        await query.edit_message_text(f"♻️ Пересчёт маршрута {vid} пока без перестроения пути. Итоги обновляйте через удаление/добавление.")
         return
 
     # === Отмена редактирования ===
     if data == "cancel_edit":
         await query.edit_message_text("↩️ Редактирование отменено.")
+        return
+
+    # === Кнопки водителя: выполнено/не выполнено ===
+    if data.startswith(("done:", "fail:")):
+        _, row_str = data.split(":")
+        row_idx = int(row_str)
+        try:
+            status = "выполнено" if data.startswith("done:") else "не выполнено"
+            now_str = now_human()
+            # кто нажал
+            from_user = update.effective_user
+            driver_name = from_user.username or f"id_{from_user.id}"
+            # ищем госномер по листу Водители
+            car_plate = ""
+            try:
+                ws_drv = client.open(SHEET_NAME).worksheet("Водители")
+                recs = ws_drv.get_all_records()
+                m = next((r for r in recs if str(r.get("telegram id","")).strip() == str(from_user.id)), None)
+                if m:
+                    car_plate = str(m.get("Гос номер",""))
+            except Exception:
+                pass
+
+            # Запись в основные колонки
+            if COL_STATUS:      sheet.update_cell(row_idx, COL_STATUS, status)
+            if COL_DRIVER:      sheet.update_cell(row_idx, COL_DRIVER, driver_name)
+            if COL_UPDATED:     sheet.update_cell(row_idx, COL_UPDATED, now_str)
+            if COL_CAR_PLATE and car_plate: sheet.update_cell(row_idx, COL_CAR_PLATE, car_plate)
+
+            await query.edit_message_text(("✅ Отмечено выполнено" if status=="выполнено" else "❌ Отмечено не выполнено"))
+        except Exception as e:
+            logger.error(f"Ошибка отметки статуса: {e}")
+            await query.edit_message_text("⚠️ Не удалось записать статус в таблицу.")
         return
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ===
@@ -1320,12 +1454,16 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
     """
     Отправляет маршрут конкретному водителю.
     Данные берём из application.bot_data, а сообщения шлём через context.bot.
+    Каждая заявка уходит отдельным сообщением с кнопками.
     """
     bot = context.bot
     store = context.application.bot_data
 
     routes_by_vehicle = store.get("routes_by_vehicle", {})
     job_info = store.get("job_info", {})
+    row_index_by_job_id = store.get("row_index_by_job_id", {})
+    coords_cache = store.get("coords_cache", {})
+    vehicles = store.get("vehicles", {})
 
     data = routes_by_vehicle.get(vid)
     if not data:
@@ -1333,9 +1471,9 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         return
 
     # данные о водителе
-    drv = drivers_data.get(vid)
+    drv = drivers_data.get(vid) or {}
     tg_id = None
-    if drv and drv.get("telegram_id"):
+    if drv.get("telegram_id"):
         try:
             tg_id = int(drv["telegram_id"])
         except Exception:
@@ -1345,18 +1483,10 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         try:
             ws = client.open(SHEET_NAME).worksheet("Водители")
             records = ws.get_all_records()
-            # ищем по госномеру из оперативки, если он есть
-            match = None
-            if drv and drv.get("car_plate"):
-                match = next((r for r in records if str(r.get("гос номер","")).strip() == drv.get("car_plate","")), None)
-            if not match:
-                # запасной поиск: по id водителя, если совпадает с номером строки/ключом
-                match = next((r for r in records if str(r.get("telegram id","")).strip()), None)
-            if match:
-                try:
-                    tg_id = int(str(match.get("telegram id") or match.get("Telegram ID") or "0"))
-                except Exception:
-                    tg_id = None
+            # поиск по id в таблице
+            m = next((r for r in records if str(r.get("telegram id","")).strip()), None)
+            if m:
+                tg_id = int(str(m.get("telegram id") or m.get("Telegram ID") or "0"))
         except Exception as e:
             logger.error(f"Не удалось найти Telegram ID для водителя {vid}: {e}")
 
@@ -1364,54 +1494,34 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ У водителя {vid} нет Telegram ID.")
         return
 
-    username = (drv.get("username") if drv else None) or f"id_{vid}"
-    job_steps = data["steps"]
-    total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
-    total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
+    vehicle = vehicles.get(vid, {"description": f"id_{vid}"})
+    header = f"{vehicle.get('description','')}" + (f" | {vehicle.get('car_plate','')}" if vehicle.get("car_plate") else "")
+    await bot.send_message(chat_id=tg_id, text=f"🧭 Ваш маршрут на сегодня ({header}):")
 
-    lines = []
-    for s in job_steps:
+    # по каждой заявке — отдельное сообщение с кнопками
+    for s in data["steps"]:
         jid = int(s["job"])
         info = job_info.get(jid, {})
+        row_idx = row_index_by_job_id.get(jid)
+        lat = lon = None
+        if row_idx in coords_cache:
+            lon, lat = coords_cache[row_idx]
         eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-        lines.append(f"• №{info.get('order_no', jid)} — {info.get('addr', '')}" + (f" (ETA {eta_str})" if eta_str else ""))
+        text = f"• №{info.get('order_no', jid)} — {info.get('addr','')}" + (f" (ETA {eta_str})" if eta_str else "")
+        kb = build_task_keyboard(lat if lat is not None else None,
+                                 lon if lon is not None else None,
+                                 row_idx if row_idx else 2)
+        try:
+            await bot.send_message(chat_id=tg_id, text=text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Не отправилась заявка {jid} водителю {vid}: {e}")
 
-    route_text = "🧭 Ваш маршрут на сегодня:\n" + ("\n".join(lines) if lines else "Заявок нет")
-    if lines:
-        route_text += f"\n\nИтого: объём {total_vol_m3} м³ / вес {total_wgt_kg} кг"
-    route_text += f"\n🛣 Пробег маршрута: ~{data['route_km']:.1f} км"
+    # итоговка
+    total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in data["steps"] if int(s["job"]) in job_info)
+    total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in data["steps"] if int(s["job"]) in job_info)
+    await bot.send_message(chat_id=tg_id, text=f"Итого: объём {total_vol_m3} м³ / вес {total_wgt_kg} кг\n🛣 Пробег: ~{data['route_km']:.1f} км")
 
-    try:
-        await bot.send_message(chat_id=tg_id, text=route_text)
-        await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {username} (id={tg_id}).")
-    except Exception as e:
-        logger.error(f"Не удалось отправить маршрут водителю {vid}: {e}")
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Не смогли отправить маршрут водителю {username}.")
-
-async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
-    """Режим редактирования маршрута: можно убирать заказы из маршрута."""
-    routes_by_vehicle = context.bot_data.get("routes_by_vehicle", {})
-    job_info = context.bot_data.get("job_info", {})
-
-    data = routes_by_vehicle.get(vid, {})
-    job_steps = data.get("steps", [])
-    if not job_steps:
-        await update.effective_message.reply_text("⚠️ У этого маршрута нет заказов.")
-        return
-
-    buttons = []
-    for s in job_steps:
-        jid = int(s["job"])
-        order_no = job_info.get(jid, {}).get("order_no", str(jid))
-        addr = job_info.get(jid, {}).get("addr", "")
-        short_addr = addr.split(",")[0] if addr else ""
-        buttons.append([InlineKeyboardButton(f"🗑 Убрать №{order_no} ({short_addr})", callback_data=f"remove:{vid}:{jid}")])
-
-    kb = InlineKeyboardMarkup(buttons + [
-        [InlineKeyboardButton("♻️ Пересчитать маршрут", callback_data=f"recalc:{vid}")],
-        [InlineKeyboardButton("↩️ Отмена", callback_data="cancel_edit")]
-    ])
-    await update.effective_message.reply_text("✏️ Выберите заказы, которые нужно убрать:", reply_markup=kb)
+    await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {header} (id={tg_id}).")
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
