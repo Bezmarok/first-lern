@@ -536,6 +536,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         out["Стоимость доставки (для расчёта)"] = 0.0
 
     # группировка
+        # группировка
     if not out.empty and "номер заявки" in out.columns:
         agg_funcs = {
             "Вес заказа": "sum",
@@ -553,14 +554,21 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         out["Вес заказа"] = out["Вес заказа"].apply(lambda x: round(parse_num(x, 0.0), 1))
         out["Объем заказа"] = out["Объем заказа"].apply(lambda x: round(parse_num(x, 0.0), 2))
         out["Количество товара"] = out["Количество товара"].apply(lambda x: int(parse_num(x, 0)))
-        out["Стоимость доставки (для расчёта)"] = out["Стоимость доставки (для расчёта)"].apply(lambda x: round(parse_num(x, 0.0), 2))
+        out["Стоимость доставки (для расчёта)"] = out["Стоимость доставки (для расчёта)"].apply(
+            lambda x: round(parse_num(x, 0.0), 2)
+        )
 
-        # убираем "мусорные" заявки вроде "доставка товара клиенту"
-    mask = ~out["наименование"].str.lower().str.contains("доставка товара клиенту", na=False)
+    # --- исправленный фильтр ---
+    # раньше: contains("доставка товара клиенту") — удалял даже частичные совпадения
+    # теперь удаляет только строки, где ВСЯ ячейка = "доставка товара клиенту"
+    mask = ~out["наименование"].str.lower().str.fullmatch("доставка товара клиенту", na=False)
     out = out.loc[mask].reset_index(drop=True)
 
     out = out.reset_index(drop=True)
-    logger.debug(f"Итог к загрузке: строк {len(out)}; примеры стоимостей: {out['Стоимость доставки (для расчёта)'].head(5).tolist()}")
+    logger.debug(
+        f"Итог к загрузке: строк {len(out)}; "
+        f"примеры стоимостей: {out['Стоимость доставки (для расчёта)'].head(5).tolist()}"
+    )
     return out
 
     # === ОБРАБОТКА ФАЙЛОВ ОТ АДМИНА ===
@@ -1787,3 +1795,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
+    
