@@ -450,11 +450,40 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     # --- наполнение ---
     def clean_order(v) -> str:
-        s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
-        s = re.sub(r"[гГ\-]", "", s)
-        s = re.sub(r"[^0-9A-Za-z]", "", s)
-        s = s.lstrip("0")  # убираем ведущие нули
-        return s.upper()
+    """
+    Чистит значение номера заявки.
+    Новое поведение:
+      — Удаляет всё до первого дефиса (включительно), если он есть;
+      — Сохраняет только цифры и латинские буквы после дефиса;
+      — Убирает ведущие нули и приводит результат к верхнему регистру.
+
+    Примеры:
+        'ПБ6-146945' → '146945'
+        'М56-147705' → '147705'
+        'Г-19315975' → '19315975'
+        'MLL-050815' → '050815'
+        '000123' → '123'
+    """
+    import re, uuid
+    # базовая подготовка
+    s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
+    s = s.replace("–", "-").replace("—", "-")
+
+    # если есть дефис — удаляем всё, что до него включительно
+    if "-" in s:
+        s = s.split("-", 1)[1]
+
+    # оставляем только цифры и латиницу, убираем остальное
+    s = re.sub(r"[^0-9A-Za-z]", "", s)
+
+    # убираем ведущие нули
+    s = s.lstrip("0")
+
+    # подстраховка: если строка пуста — сгенерировать временный ID
+    if not s:
+        s = f"TMP-{uuid.uuid4().hex[:6].upper()}"
+
+    return s.upper()
 
     out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
 
@@ -950,13 +979,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=markup
         )
     else:
-        # Водителю оставляем прежнюю логику (инлайн-кнопка)
+        # Меню для водителя (inline-кнопки)
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
+            [
+                InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")
+            ],
+            [
+                InlineKeyboardButton("📊 Итоги дня", callback_data="summary")
+            ]
         ])
         await update.message.reply_text(
-            "Укажи параметры машины, например:\n`2.5, 500, А123ВС78`\n(объём м³, вес кг, госномер)\n\n"
-            "После назначения маршрута вы сможете смотреть свой доход.",
+            "Укажи параметры машины, например:\n"
+            "`2.5, 500, А123ВС78`\n"
+            "(объём м³, вес кг, госномер)\n\n"
+            "После назначения маршрута ты сможешь смотреть свой доход "
+            "и итоги дня по выполненным заявкам.",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -1324,6 +1361,128 @@ async def optimize_and_assign(bot, context=None):
     return True
 
 # === ОБРАБОТЧИК КНОПОК ===
+async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
+    """
+    Позволяет админу редактировать маршрут:
+    - удалить точку (заявку) из маршрута;
+    - передать заявку другому водителю;
+    - открыть маршрут целиком в Google Maps.
+    """
+    query = update.callback_query
+    store = context.application.bot_data
+    routes_by_vehicle = store.get("routes_by_vehicle", {})
+    job_info = store.get("job_info", {})
+    vehicles = store.get("vehicles", {})
+    coords_cache = store.get("coords_cache", {})
+
+    if vid not in routes_by_vehicle:
+        await query.edit_message_text(f"⚠️ Маршрут для водителя {vid} не найден.")
+        return
+
+    route = routes_by_vehicle[vid]
+    steps = route.get("steps", [])
+    if not steps:
+        await query.edit_message_text(f"ℹ️ У водителя {vid} нет активных заявок.")
+        return
+
+    drv = vehicles.get(vid, {"description": f"id_{vid}"})
+    header = f"{drv.get('description', '')}" + (f" | {drv.get('car_plate', '')}" if drv.get("car_plate") else "")
+
+    # Список точек маршрута
+    lines = []
+    route_points = []
+    for s in steps:
+        jid = int(s["job"])
+        info = job_info.get(jid, {})
+        addr = info.get("addr", "Без адреса")
+        row_idx = store.get("row_index_by_job_id", {}).get(jid)
+        lon = lat = None
+        if row_idx in coords_cache:
+            lon, lat = coords_cache[row_idx]
+        if lat and lon:
+            route_points.append((lat, lon))
+        eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+        lines.append(
+            f"• №{info.get('order_no', jid)} — {addr}"
+            + (f" (ETA {eta_str})" if eta_str else "")
+        )
+
+    # Построение ссылки на Google Maps
+    if route_points:
+        wh_lat = float(WAREHOUSE_LAT)
+        wh_lon = float(WAREHOUSE_LON)
+        route_url = build_google_maps_multistop([(wh_lat, wh_lon)] + route_points + [(wh_lat, wh_lon)])
+    else:
+        route_url = "https://maps.google.com"
+
+    # Формируем текст
+    route_text = (
+        f"✏️ Редактирование маршрута: {header}\n\n"
+        f"Заявок: {len(steps)}\n"
+        f"Пробег: ~{route.get('route_km', 0):.1f} км\n\n"
+        + "\n".join(lines)
+    )
+
+    # Кнопки: удалить / передать / карта / выход
+    kb_rows = []
+    for s in steps:
+        jid = int(s["job"])
+        info = job_info.get(jid, {})
+        order_no = info.get("order_no", jid)
+        kb_rows.append([
+            InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"remove:{vid}:{jid}"),
+            InlineKeyboardButton(f"🔄 Передать", callback_data=f"transfer:{vid}:{jid}")
+        ])
+    kb_rows.append([InlineKeyboardButton("🗺 Посмотреть маршрут", url=route_url)])
+    kb_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"recalc:{vid}")])
+
+    await query.edit_message_text(route_text, reply_markup=InlineKeyboardMarkup(kb_rows))
+async def transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int, jid: int):
+    """
+    Позволяет админу передать заявку (jid) другому водителю с листа 'Водители'.
+    В списке показываются только водители, у которых есть госномер.
+    """
+    query = update.callback_query
+    bot = context.bot
+    store = context.application.bot_data
+
+    # Считываем всех водителей из таблицы
+    try:
+        ws = client.open(SHEET_NAME).worksheet("Водители")
+        records = ws.get_all_records()
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Не удалось прочитать лист 'Водители': {e}")
+        return
+
+    # Фильтруем только тех, у кого указан госномер
+    available_drivers = [
+        r for r in records if str(r.get("Гос номер", "")).strip()
+    ]
+
+    if not available_drivers:
+        await query.edit_message_text("⚠️ Нет водителей с указанными госномерами. Передача невозможна.")
+        return
+
+    # Формируем список кнопок по госномерам
+    kb = []
+    for r in available_drivers:
+        car_plate = str(r.get("Гос номер")).strip()
+        drv_name = r.get("Имя", "") or r.get("ФИО", "") or f"Водитель {car_plate}"
+        drv_id = str(r.get("telegram id", "") or r.get("Telegram ID", "") or "").strip()
+        kb.append([
+            InlineKeyboardButton(
+                f"{drv_name} ({car_plate})",
+                callback_data=f"confirm_transfer:{vid}:{jid}:{car_plate}"
+            )
+        ])
+
+    kb.append([InlineKeyboardButton("↩️ Отмена", callback_data=f"edit:{vid}")])
+
+    await query.edit_message_text(
+        f"Выберите, кому передать заявку №{jid}:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1442,6 +1601,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка удаления заказа: {e}")
             await query.edit_message_text("⚠️ Не удалось удалить заказ.")
+        return
+
+    # === Передача заявки другому водителю ===
+    if data.startswith("transfer:"):
+        _, vid_str, jid_str = data.split(":")
+        vid, jid = int(vid_str), int(jid_str)
+        await transfer_route(update, context, vid, jid)
+        return
+
+    # === Подтверждение передачи заявки ===
+    if data.startswith("confirm_transfer:"):
+        try:
+            _, vid_str, jid_str, car_plate = data.split(":")
+            vid, jid = int(vid_str), int(jid_str)
+            # Обновляем данные заявки в листе
+            row_idx = context.application.bot_data.get("row_index_by_job_id", {}).get(jid)
+            if not row_idx:
+                await query.edit_message_text("⚠️ Не удалось найти строку заявки в таблице.")
+                return
+            if COL_DRIVER:
+                sheet.update_cell(row_idx, COL_DRIVER, car_plate)
+            if COL_STATUS:
+                sheet.update_cell(row_idx, COL_STATUS, "выполняется")
+            if COL_UPDATED:
+                sheet.update_cell(row_idx, COL_UPDATED, now_human())
+
+            await query.edit_message_text(f"✅ Заявка №{jid} передана водителю с госномером {car_plate}.")
+        except Exception as e:
+            logger.error(f"Ошибка при передаче заявки: {e}")
+            await query.edit_message_text(f"⚠️ Не удалось передать заявку: {e}")
         return
 
     # === Пересчёт маршрута (плейсхолдер) ===
