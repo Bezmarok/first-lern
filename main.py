@@ -454,7 +454,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         import re, uuid
 
         # если None или NaN
-        if v is None or (isinstance(v, float) and pd.isna(v)):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
 
         # переводим в строку и убираем пробелы
@@ -464,7 +464,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         s = s.replace("–", "-").replace("—", "-")
 
         # если есть дефис — обрезаем всё до первого
-        if "-" in s:
+    if "-" in s:
             s = s.split("-", 1)[1]
 
         # чистим от всего, кроме цифр и латиницы
@@ -474,7 +474,7 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         s = s.lstrip("0")
 
         # защита — если после чистки пусто, подставляем временный ID
-        if not s:
+    if not s:
         s = f"TMP-{uuid.uuid4().hex[:6].upper()}"
 
         return s.upper()
