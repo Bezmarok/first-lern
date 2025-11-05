@@ -452,25 +452,32 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     def clean_order(v) -> str:
     
         import re, uuid
-        # базовая подготовка
-        s = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip()
+
+        # если None или NaN
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+
+        # переводим в строку и убираем пробелы
+        s = str(v).strip()
+
+        # нормализуем дефисы
         s = s.replace("–", "-").replace("—", "-")
 
-        # если есть дефис — удаляем всё, что до него включительно
+        # если есть дефис — обрезаем всё до первого
         if "-" in s:
             s = s.split("-", 1)[1]
 
-        # оставляем только цифры и латиницу, убираем остальное
+        # чистим от всего, кроме цифр и латиницы
         s = re.sub(r"[^0-9A-Za-z]", "", s)
 
         # убираем ведущие нули
         s = s.lstrip("0")
 
-        # подстраховка: если строка пуста — сгенерировать временный ID
-    if not s:
+        # защита — если после чистки пусто, подставляем временный ID
+        if not s:
         s = f"TMP-{uuid.uuid4().hex[:6].upper()}"
 
-    return s.upper()
+        return s.upper()
 
     out["номер заявки"] = safe_col(df, c_order).astype(str).map(clean_order) if c_order else ""
 
