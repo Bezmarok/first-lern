@@ -264,8 +264,6 @@ def build_point_route_url(lat: float | None, lon: float | None) -> str:
         return "https://maps.google.com"
     return f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f}%2C{lon:.6f}&travelmode=driving"
 
-from urllib.parse import quote
-
 def build_google_maps_multistop(points: list[tuple[float, float]]) -> str:
     """
     Собирает корректную ссылку Google Maps с несколькими точками маршрута.
@@ -300,6 +298,59 @@ def build_google_maps_multistop(points: list[tuple[float, float]]) -> str:
             f"&travelmode=driving"
         )
     return url
+
+def prepare_payload_for_ors(payload: dict) -> dict:
+    """
+    Подготавливает payload перед отправкой в OpenRouteService:
+      • чистит description (оставляет только улицу и дом)
+      • обрезает до 80 символов
+      • защищает от ошибки 413 (слишком большой запрос)
+    """
+    if not payload or "jobs" not in payload:
+        return payload
+
+    for job in payload["jobs"]:
+        desc = str(job.get("description", "")).strip()
+        if not desc:
+            continue
+
+        # Удаляем страну, город, регион
+        desc = re.sub(
+            r"(россия|russia|санкт[- ]петербург|москва|moscow|spb)[, ]*",
+            "",
+            desc,
+            flags=re.IGNORECASE
+        )
+
+        # Убираем квартиру, офис, строения и всё после
+        desc = re.sub(
+            r"(кв\.?\s*\S*|офис\s*\S*|пом\.?\s*\S*|лит\.?\s*\S*|строение\s*\S*).*",
+            "",
+            desc,
+            flags=re.IGNORECASE
+        )
+
+        # Ищем улицу и дом
+        m = re.search(r"((ул\.?|просп\.?|проспект|пер\.?|переулок|шоссе|бульвар|наб\.?)\s*[А-Яа-яA-Za-zёЁ0-9\s\-]+?[\s,]*\d+\S*)", desc)
+        if m:
+            desc = m.group(1)
+        else:
+            # fallback: первая часть с цифрой
+            m = re.search(r"[А-Яа-яA-Za-z\s]+\d+\S*", desc)
+            if m:
+                desc = m.group(0)
+
+        # Подрезаем пробелы и длину
+        job["description"] = desc.strip()[:80]
+
+    # Проверяем общий размер тела
+    body_bytes = len(json.dumps(payload).encode("utf-8"))
+    if body_bytes > 7000:
+        print(f"⚠️ ORS payload {body_bytes} bytes — длинный, обрезаем описания сильнее")
+        for job in payload["jobs"]:
+            job["description"] = job.get("description", "")[:50]
+
+    return payload
 
 # === safe_col для борьбы с дублями ===
 def safe_col(df, name):
@@ -949,7 +1000,7 @@ def reason_for_unassigned(job, vehicles):
 def ors_optimize(jobs, vehicles):
     """
     Отправляет корректный JSON в ORS. Перед отправкой валидируем,
-    что amount/capacity состоят из ЦЕЛЫХ чисел.
+    что amount/capacity состоят из ЦЕЛЫХ чисел и чистим description.
     """
     # валидация целочисленности
     for j in jobs:
@@ -971,6 +1022,9 @@ def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
+
+    # 🧹 очистка и защита от ошибки 413
+    payload = prepare_payload_for_ors(payload)
 
     try:
         sample = {
