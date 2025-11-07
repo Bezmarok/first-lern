@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from math import radians, sin, cos, asin, sqrt
 from urllib.parse import quote
+from uuid import uuid4
+routes_cache = {}
 
 import gspread
 import pandas as pd
@@ -1841,6 +1843,132 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
 
     await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {header} (id={tg_id}).")
 
+# === НОВЫЙ БЛОК: ПРОДВИНУТОЕ РЕДАКТИРОВАНИЕ МАРШРУТОВ ===
+
+async def open_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает маршрут водителя и позволяет удалить или передать точки."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    _, vid = data.split(":")
+    vid = int(vid)
+
+    store = context.application.bot_data
+    routes = store.get("routes_by_vehicle", {})
+    job_info = store.get("job_info", {})
+    vehicles = store.get("vehicles", {})
+    route = routes.get(vid)
+
+    if not route:
+        await query.edit_message_text(f"⚠️ У водителя {vid} нет маршрута.")
+        return
+
+    header = vehicles.get(vid, {}).get("description", f"id_{vid}")
+    steps = route.get("steps", [])
+    if not steps:
+        await query.edit_message_text(f"⚠️ У водителя {header} нет активных точек.")
+        return
+
+    route_id = str(uuid4())
+    routes_cache[route_id] = {"vid": vid, "steps": steps}
+
+    lines = []
+    for s in steps:
+        jid = int(s["job"])
+        info = job_info.get(jid, {})
+        addr = info.get("addr", "Без адреса")
+        lines.append(f"• №{info.get('order_no', jid)} — {addr}")
+
+    kb = []
+    for i, s in enumerate(steps):
+        jid = int(s["job"])
+        order_no = job_info.get(jid, {}).get("order_no", jid)
+        kb.append([InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"edit_del:{route_id}:{jid}")])
+    kb.append([InlineKeyboardButton("📤 Передать маршрут", callback_data=f"edit_transfer:{route_id}")])
+    kb.append([InlineKeyboardButton("✅ Завершить", callback_data="edit_done")])
+
+    text = f"✏️ Редактирование маршрута {header}\n\n" + "\n".join(lines)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def edit_delete_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет точку из маршрута."""
+    query = update.callback_query
+    await query.answer()
+    _, route_id, jid = query.data.split(":")
+    jid = int(jid)
+
+    route = routes_cache.get(route_id)
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    before = len(route["steps"])
+    route["steps"] = [s for s in route["steps"] if int(s["job"]) != jid]
+    after = len(route["steps"])
+    diff = before - after
+
+    msg = f"❌ Удалено {diff} точек. Осталось {after}."
+    kb = [
+        [InlineKeyboardButton("📤 Передать маршрут", callback_data=f"edit_transfer:{route_id}")],
+        [InlineKeyboardButton("✅ Завершить", callback_data="edit_done")]
+    ]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+
+async def edit_transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Передаёт редактированный маршрут другому водителю."""
+    query = update.callback_query
+    await query.answer()
+    _, route_id = query.data.split(":")
+    route = routes_cache.get(route_id)
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    ws = client.open(SHEET_NAME).worksheet("Водители")
+    records = ws.get_all_records()
+    kb = []
+    for r in records:
+        car = str(r.get("Гос номер", "")).strip()
+        drv = r.get("ФИО", "") or car
+        tg = str(r.get("telegram id", "")).strip()
+        if tg:
+            kb.append([InlineKeyboardButton(f"{drv} ({car})", callback_data=f"edit_transfer_confirm:{route_id}:{tg}")])
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_done")])
+
+    await query.edit_message_text("Выберите, кому передать маршрут:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def edit_transfer_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет оставшийся маршрут выбранному водителю."""
+    query = update.callback_query
+    await query.answer()
+    _, route_id, tg_id = query.data.split(":")
+    tg_id = int(tg_id)
+    route = routes_cache.get(route_id)
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    store = context.application.bot_data
+    job_info = store.get("job_info", {})
+    steps = route["steps"]
+    text = "🚚 Новый маршрут для вас:\n\n" + "\n".join(
+        f"• №{job_info.get(int(s['job']),{}).get('order_no',s['job'])} — {job_info.get(int(s['job']),{}).get('addr','')}"
+        for s in steps
+    )
+
+    try:
+        await context.bot.send_message(chat_id=tg_id, text=text)
+        await query.edit_message_text("✅ Маршрут успешно передан выбранному водителю.")
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Ошибка при отправке маршрута: {e}")
+
+async def edit_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("✅ Редактирование завершено.")
+
+
 # === ЗАПУСК ===
 if __name__ == "__main__":
     TOKEN = os.environ.get("BOT_TOKEN")
@@ -1865,5 +1993,11 @@ if __name__ == "__main__":
 
     # Общий текст: регистрация водителей. ВАЖНО исключить админа
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
+
+    app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit_route:"))
+    app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
+    app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
+    app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
+    app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
 
     app.run_polling()
