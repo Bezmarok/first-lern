@@ -999,10 +999,14 @@ def reason_for_unassigned(job, vehicles):
 
 def ors_optimize(jobs, vehicles):
     """
-    Отправляет корректный JSON в ORS. Перед отправкой валидируем,
-    что amount/capacity состоят из ЦЕЛЫХ чисел и чистим description.
+    Отправляет корректный JSON в ORS.
+    Логика не изменена:
+      • проверяем валидность jobs и vehicles
+      • делаем POST на optimization
+    Добавлено:
+      • защита от слишком длинных description (если кто-то случайно сунул туда адрес)
     """
-    # валидация целочисленности
+    # --- проверка целочисленности и корректности данных ---
     for j in jobs:
         if not isinstance(j.get("amount"), list) or len(j["amount"]) != 2:
             raise ValueError(f"Job {j.get('id')} имеет некорректный amount={j.get('amount')}")
@@ -1015,21 +1019,39 @@ def ors_optimize(jobs, vehicles):
         cap = v.get("capacity")
         if not isinstance(cap, list) or len(cap) != 2 or any((not isinstance(x, int)) for x in cap):
             raise ValueError(f"Vehicle {v.get('id')} capacity должен быть целым: {cap}")
-        loc_ok = isinstance(v.get("start"), list) and isinstance(v.get("end"), list) and len(v["start"]) == 2 and len(v["end"]) == 2
+        loc_ok = (
+            isinstance(v.get("start"), list)
+            and isinstance(v.get("end"), list)
+            and len(v["start"]) == 2
+            and len(v["end"]) == 2
+        )
         if not loc_ok:
             raise ValueError(f"Vehicle {v.get('id')} некорректные start/end")
 
+    # --- сборка запроса ---
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
 
-    # 🧹 очистка и защита от ошибки 413
-    payload = prepare_payload_for_ors(payload)
+    # --- защита от раздутых описаний ---
+    import re
+    for job in payload["jobs"]:
+        desc = str(job.get("description", "")).strip()
+        if len(desc) > 1000:
+            # если вдруг кто-то туда запихнул адрес
+            m = re.search(r"((ул\.?|просп\.?|пер\.?|переулок|шоссе|бульвар)\s*[А-Яа-яA-Za-z0-9\s\-]+?\d+\S*)", desc)
+            if m:
+                desc = m.group(1)
+            else:
+                desc = desc[:80]
+            job["description"] = desc.strip()
+        # если нет — оставляем номер заявки как есть
 
+    # --- логируем короткий сэмпл ---
     try:
         sample = {
             "jobs": [{k: j[k] for k in ("id", "location", "amount")} for j in jobs[:5]],
-            "vehicles": [{k: v[k] for k in ("id", "capacity")} for v in vehicles[:3]]
+            "vehicles": [{k: v[k] for k in ("id", "capacity")} for v in vehicles[:3]],
         }
         logger.debug("📤 ORS payload (sample): %s", json.dumps(sample, ensure_ascii=False))
     except Exception:
@@ -1037,6 +1059,7 @@ def ors_optimize(jobs, vehicles):
 
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
+    # --- запрос в ORS ---
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     return r.json()
