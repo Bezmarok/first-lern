@@ -1880,6 +1880,8 @@ async def open_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addr = info.get("addr", "Без адреса")
         lines.append(f"• №{info.get('order_no', jid)} — {addr}")
 
+    kb.append([InlineKeyboardButton("📦 Передать весь маршрут", callback_data=f"edit_transfer_whole:{route_id}")])
+
     kb = []
     for i, s in enumerate(steps):
         jid = int(s["job"])
@@ -1963,6 +1965,62 @@ async def edit_transfer_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await query.edit_message_text(f"⚠️ Ошибка при отправке маршрута: {e}")
 
+# === ПЕРЕДАЧА ВСЕГО МАРШРУТА ===
+
+async def edit_transfer_whole_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список водителей для передачи всего маршрута."""
+    query = update.callback_query
+    await query.answer()
+    _, route_id = query.data.split(":")
+    route = routes_cache.get(route_id)
+
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    ws = client.open(SHEET_NAME).worksheet("Водители")
+    records = ws.get_all_records()
+    kb = []
+    for r in records:
+        car = str(r.get("Гос номер", "")).strip()
+        drv = r.get("ФИО", "") or car
+        tg = str(r.get("telegram id", "")).strip()
+        if tg:
+            kb.append([InlineKeyboardButton(f"{drv} ({car})", callback_data=f"edit_transfer_whole_confirm:{route_id}:{tg}")])
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_done")])
+
+    await query.edit_message_text("🚚 Кому передать весь маршрут:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def edit_transfer_whole_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Передаёт весь маршрут выбранному водителю."""
+    query = update.callback_query
+    await query.answer()
+    _, route_id, tg_id = query.data.split(":")
+    tg_id = int(tg_id)
+    route = routes_cache.get(route_id)
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    store = context.application.bot_data
+    job_info = store.get("job_info", {})
+    steps = route["steps"]
+
+    if not steps:
+        await query.edit_message_text("⚠️ В маршруте нет заявок.")
+        return
+
+    text = "🚛 Новый маршрут полностью для вас:\n\n" + "\n".join(
+        f"• №{job_info.get(int(s['job']),{}).get('order_no',s['job'])} — {job_info.get(int(s['job']),{}).get('addr','')}"
+        for s in steps
+    )
+
+    try:
+        await context.bot.send_message(chat_id=tg_id, text=text)
+        await query.edit_message_text("✅ Весь маршрут передан выбранному водителю.")
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Ошибка при отправке маршрута: {e}")
+
 async def edit_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1999,5 +2057,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
     app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
+    app.add_handler(CallbackQueryHandler(edit_transfer_whole_route, pattern=r"^edit_transfer_whole:"))
+    app.add_handler(CallbackQueryHandler(edit_transfer_whole_confirm, pattern=r"^edit_transfer_whole_confirm:"))
 
     app.run_polling()
