@@ -1123,7 +1123,6 @@ async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Ваш заработок за {now.strftime('%d.%m.%Y')}:\n"
         f"Заявок выполнено: {len([r for r in orders if str(r.get('id','')).strip() == driver_id and str(r.get('Статус','')).strip().lower() == 'выполнено' and try_parse_datetime(r.get('Факт Дата и время')) and try_parse_datetime(r.get('Факт Дата и время')).date() == now.date()])}\n"
         f"Сумма заявок: {total_today:.2f} ₽\n"
-        f"Коэффициент: {coef}\n"
         f"Итого: {total_with_coef:.2f} ₽"
     )
     await update.message.reply_text(msg)
@@ -1375,12 +1374,7 @@ async def optimize_and_assign(bot, context=None):
 
 # === ОБРАБОТЧИК КНОПОК ===
 async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
-    """
-    Позволяет админу редактировать маршрут:
-    - удалить точку (заявку) из маршрута;
-    - передать заявку другому водителю;
-    - открыть маршрут целиком в Google Maps.
-    """
+    """Редактирование маршрута администратора (исправлено: корректно работает с длинными сообщениями)"""
     query = update.callback_query
     store = context.application.bot_data
     routes_by_vehicle = store.get("routes_by_vehicle", {})
@@ -1388,18 +1382,18 @@ async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE
     vehicles = store.get("vehicles", {})
     coords_cache = store.get("coords_cache", {})
 
-    if vid not in routes_by_vehicle:
+    route = routes_by_vehicle.get(vid)
+    if not route:
         await query.edit_message_text(f"⚠️ Маршрут для водителя {vid} не найден.")
         return
 
-    route = routes_by_vehicle[vid]
     steps = route.get("steps", [])
     if not steps:
         await query.edit_message_text(f"ℹ️ У водителя {vid} нет активных заявок.")
         return
 
     drv = vehicles.get(vid, {"description": f"id_{vid}"})
-    header = f"{drv.get('description', '')}" + (f" | {drv.get('car_plate', '')}" if drv.get("car_plate") else "")
+    header = f"{drv.get('description', '')}" + (f" | {drv.get('car_plate', '')}" if drv.get('car_plate') else "")
 
     # Список точек маршрута
     lines = []
@@ -1415,28 +1409,26 @@ async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE
         if lat and lon:
             route_points.append((lat, lon))
         eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-        lines.append(
-            f"• №{info.get('order_no', jid)} — {addr}"
-            + (f" (ETA {eta_str})" if eta_str else "")
-        )
+        lines.append(f"• №{info.get('order_no', jid)} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
 
-    # Построение ссылки на Google Maps
+    # Формирование ссылки на карту
     if route_points:
-        wh_lat = float(WAREHOUSE_LAT)
-        wh_lon = float(WAREHOUSE_LON)
+        wh_lat, wh_lon = float(WAREHOUSE_LAT), float(WAREHOUSE_LON)
         route_url = build_google_maps_multistop([(wh_lat, wh_lon)] + route_points + [(wh_lat, wh_lon)])
     else:
         route_url = "https://maps.google.com"
 
-    # Формируем текст
     route_text = (
-        f"✏️ Редактирование маршрута: {header}\n\n"
+        f"✏️ Редактирование маршрута: {header}\n"
         f"Заявок: {len(steps)}\n"
         f"Пробег: ~{route.get('route_km', 0):.1f} км\n\n"
         + "\n".join(lines)
     )
 
-    # Кнопки: удалить / передать / карта / выход
+    # ограничиваем длину сообщения для Telegram
+    if len(route_text) > 3800:
+        route_text = route_text[:3790] + "\n…(сокращено)"
+
     kb_rows = []
     for s in steps:
         jid = int(s["job"])
@@ -1446,20 +1438,15 @@ async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"remove:{vid}:{jid}"),
             InlineKeyboardButton(f"🔄 Передать", callback_data=f"transfer:{vid}:{jid}")
         ])
-    kb_rows.append([InlineKeyboardButton("🗺 Посмотреть маршрут", url=route_url)])
+    kb_rows.append([InlineKeyboardButton("🗺 Открыть маршрут", url=route_url)])
     kb_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"recalc:{vid}")])
 
     await query.edit_message_text(route_text, reply_markup=InlineKeyboardMarkup(kb_rows))
-async def transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int, jid: int):
-    """
-    Позволяет админу передать заявку (jid) другому водителю с листа 'Водители'.
-    В списке показываются только водители, у которых есть госномер.
-    """
-    query = update.callback_query
-    bot = context.bot
-    store = context.application.bot_data
 
-    # Считываем всех водителей из таблицы
+async def transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int, jid: int):
+    """Передача заявки другому водителю (фикс фильтра и нормальный список кнопок)"""
+    query = update.callback_query
+
     try:
         ws = client.open(SHEET_NAME).worksheet("Водители")
         records = ws.get_all_records()
@@ -1467,29 +1454,24 @@ async def transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid
         await query.edit_message_text(f"⚠️ Не удалось прочитать лист 'Водители': {e}")
         return
 
-    # Фильтруем только тех, у кого указан госномер
+    # теперь показываем всех, у кого есть либо госномер, либо telegram id
     available_drivers = [
-        r for r in records if str(r.get("Гос номер", "")).strip()
+        r for r in records if str(r.get("Гос номер", "")).strip() or str(r.get("telegram id", "")).strip()
     ]
 
     if not available_drivers:
-        await query.edit_message_text("⚠️ Нет водителей с указанными госномерами. Передача невозможна.")
+        await query.edit_message_text("⚠️ Нет водителей с заполненными данными для передачи.")
         return
 
-    # Формируем список кнопок по госномерам
     kb = []
     for r in available_drivers:
-        car_plate = str(r.get("Гос номер")).strip()
-        drv_name = r.get("Имя", "") or r.get("ФИО", "") or f"Водитель {car_plate}"
-        drv_id = str(r.get("telegram id", "") or r.get("Telegram ID", "") or "").strip()
-        kb.append([
-            InlineKeyboardButton(
-                f"{drv_name} ({car_plate})",
-                callback_data=f"confirm_transfer:{vid}:{jid}:{car_plate}"
-            )
-        ])
+        car_plate = str(r.get("Гос номер", "")).strip() or "без номера"
+        drv_name = r.get("ФИО", "") or r.get("Имя", "") or car_plate
+        drv_tg = str(r.get("telegram id", "") or "").strip()
+        label = f"{drv_name} ({car_plate})"
+        kb.append([InlineKeyboardButton(label, callback_data=f"confirm_transfer:{vid}:{jid}:{car_plate}")])
 
-    kb.append([InlineKeyboardButton("↩️ Отмена", callback_data=f"edit:{vid}")])
+    kb.append([InlineKeyboardButton("↩️ Назад", callback_data=f"edit:{vid}")])
 
     await query.edit_message_text(
         f"Выберите, кому передать заявку №{jid}:",
@@ -1515,9 +1497,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # === Итоги дня (админ) ===
+    # === Итоги дня (водитель или админ) ===
     if data == "summary":
-        await daily_summary(update, context)
+        if update.effective_user.id == ADMIN_ID:
+            await daily_summary(update, context)
+        else:
+            await earnings(update, context)
         return
 
     # === Заработок (водитель) ===
@@ -1795,4 +1780,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-    
