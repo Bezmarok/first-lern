@@ -300,12 +300,7 @@ def build_google_maps_multistop(points: list[tuple[float, float]]) -> str:
     return url
 
 def prepare_payload_for_ors(payload: dict) -> dict:
-    """
-    Подготавливает payload перед отправкой в OpenRouteService:
-      • чистит description (оставляет только улицу и дом)
-      • обрезает до 80 символов
-      • защищает от ошибки 413 (слишком большой запрос)
-    """
+    """Безопасная версия: убирает мусор из description, но не трогает JSON."""
     if not payload or "jobs" not in payload:
         return payload
 
@@ -314,41 +309,13 @@ def prepare_payload_for_ors(payload: dict) -> dict:
         if not desc:
             continue
 
-        # Удаляем страну, город, регион
-        desc = re.sub(
-            r"(россия|russia|санкт[- ]петербург|москва|moscow|spb)[, ]*",
-            "",
-            desc,
-            flags=re.IGNORECASE
-        )
+        # если description — это номер заявки, оставляем его
+        if re.fullmatch(r"\d{1,10}", desc):
+            continue
 
-        # Убираем квартиру, офис, строения и всё после
-        desc = re.sub(
-            r"(кв\.?\s*\S*|офис\s*\S*|пом\.?\s*\S*|лит\.?\s*\S*|строение\s*\S*).*",
-            "",
-            desc,
-            flags=re.IGNORECASE
-        )
-
-        # Ищем улицу и дом
-        m = re.search(r"((ул\.?|просп\.?|проспект|пер\.?|переулок|шоссе|бульвар|наб\.?)\s*[А-Яа-яA-Za-zёЁ0-9\s\-]+?[\s,]*\d+\S*)", desc)
-        if m:
-            desc = m.group(1)
-        else:
-            # fallback: первая часть с цифрой
-            m = re.search(r"[А-Яа-яA-Za-z\s]+\d+\S*", desc)
-            if m:
-                desc = m.group(0)
-
-        # Подрезаем пробелы и длину
-        job["description"] = desc.strip()[:80]
-
-    # Проверяем общий размер тела
-    body_bytes = len(json.dumps(payload).encode("utf-8"))
-    if body_bytes > 7000:
-        print(f"⚠️ ORS payload {body_bytes} bytes — длинный, обрезаем описания сильнее")
-        for job in payload["jobs"]:
-            job["description"] = job.get("description", "")[:50]
+        # иначе сокращаем до короткой формы адреса
+        m = re.search(r"([А-Яа-яA-Za-zёЁ0-9\s\-]{0,80})", desc)
+        job["description"] = m.group(1).strip() if m else desc[:80]
 
     return payload
 
@@ -1032,6 +999,7 @@ def ors_optimize(jobs, vehicles):
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY}
     payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
+    payload = prepare_payload_for_ors(payload)
 
     # --- защита от раздутых описаний ---
     import re
