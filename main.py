@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime, timedelta
 from collections import defaultdict
 from math import radians, sin, cos, asin, sqrt
+from urllib.parse import quote
 
 import gspread
 import pandas as pd
@@ -263,18 +264,41 @@ def build_point_route_url(lat: float | None, lon: float | None) -> str:
         return "https://maps.google.com"
     return f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f}%2C{lon:.6f}&travelmode=driving"
 
+from urllib.parse import quote
+
 def build_google_maps_multistop(points: list[tuple[float, float]]) -> str:
-    # points: [(lat, lon), ...] где points[0] — склад
+    """
+    Собирает корректную ссылку Google Maps с несколькими точками маршрута.
+    points: [(lat, lon), ...]
+    где points[0] — склад, points[-1] — точка возврата.
+    """
     if not points:
         return "https://maps.google.com"
+
     origin = f"{points[0][0]:.6f},{points[0][1]:.6f}"
+
     if len(points) == 1:
-        return f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(origin)}&travelmode=driving"
+        return f"https://www.google.com/maps/dir/?api=1&origin={quote(origin)}&travelmode=driving"
+
     destination = f"{points[-1][0]:.6f},{points[-1][1]:.6f}"
-    waypoints = [f"{lat:.6f},{lon:.6f}" for lat, lon in points[1:-1]]
-    url = f"https://www.google.com/maps/dir/?api=1&origin={urllib.parse.quote(origin)}&destination={urllib.parse.quote(destination)}&travelmode=driving"
-    if waypoints:
-        url += f"&waypoints={urllib.parse.quote('|'.join(waypoints))}"
+
+    if len(points) > 2:
+        # промежуточные точки
+        waypoints = "|".join(f"{lat:.6f},{lon:.6f}" for lat, lon in points[1:-1])
+        url = (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={quote(origin)}"
+            f"&destination={quote(destination)}"
+            f"&waypoints={quote(waypoints)}"
+            f"&travelmode=driving"
+        )
+    else:
+        url = (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={quote(origin)}"
+            f"&destination={quote(destination)}"
+            f"&travelmode=driving"
+        )
     return url
 
 # === safe_col для борьбы с дублями ===
@@ -1374,74 +1398,85 @@ async def optimize_and_assign(bot, context=None):
 
 # === ОБРАБОТЧИК КНОПОК ===
 async def start_editing_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int):
-    """Редактирование маршрута администратора (исправлено: корректно работает с длинными сообщениями)"""
+    """
+    Открывает редактор маршрута у администратора:
+      • показывает список заявок
+      • кнопки удалить / передать заявку
+      • ссылка на маршрут в Google Maps
+    """
     query = update.callback_query
     store = context.application.bot_data
-    routes_by_vehicle = store.get("routes_by_vehicle", {})
-    job_info = store.get("job_info", {})
-    vehicles = store.get("vehicles", {})
-    coords_cache = store.get("coords_cache", {})
 
-    route = routes_by_vehicle.get(vid)
-    if not route:
-        await query.edit_message_text(f"⚠️ Маршрут для водителя {vid} не найден.")
-        return
+    try:
+        routes_by_vehicle = store.get("routes_by_vehicle", {})
+        job_info = store.get("job_info", {})
+        vehicles = store.get("vehicles", {})
+        coords_cache = store.get("coords_cache", {})
 
-    steps = route.get("steps", [])
-    if not steps:
-        await query.edit_message_text(f"ℹ️ У водителя {vid} нет активных заявок.")
-        return
+        if vid not in routes_by_vehicle:
+            await query.edit_message_text(f"⚠️ Маршрут для водителя {vid} не найден.")
+            return
 
-    drv = vehicles.get(vid, {"description": f"id_{vid}"})
-    header = f"{drv.get('description', '')}" + (f" | {drv.get('car_plate', '')}" if drv.get('car_plate') else "")
+        route = routes_by_vehicle[vid]
+        steps = route.get("steps", [])
+        if not steps:
+            await query.edit_message_text(f"ℹ️ У водителя {vid} нет активных заявок.")
+            return
 
-    # Список точек маршрута
-    lines = []
-    route_points = []
-    for s in steps:
-        jid = int(s["job"])
-        info = job_info.get(jid, {})
-        addr = info.get("addr", "Без адреса")
-        row_idx = store.get("row_index_by_job_id", {}).get(jid)
-        lon = lat = None
-        if row_idx in coords_cache:
-            lon, lat = coords_cache[row_idx]
-        if lat and lon:
-            route_points.append((lat, lon))
-        eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-        lines.append(f"• №{info.get('order_no', jid)} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
+        drv = vehicles.get(vid, {"description": f"id_{vid}"})
+        header = f"{drv.get('description','')}" + (f" | {drv.get('car_plate','')}" if drv.get('car_plate') else "")
 
-    # Формирование ссылки на карту
-    if route_points:
-        wh_lat, wh_lon = float(WAREHOUSE_LAT), float(WAREHOUSE_LON)
-        route_url = build_google_maps_multistop([(wh_lat, wh_lon)] + route_points + [(wh_lat, wh_lon)])
-    else:
-        route_url = "https://maps.google.com"
+        lines = []
+        route_points = []
+        for s in steps:
+            jid = int(s["job"])
+            info = job_info.get(jid, {})
+            addr = info.get("addr", "Без адреса")
+            row_idx = store.get("row_index_by_job_id", {}).get(jid)
 
-    route_text = (
-        f"✏️ Редактирование маршрута: {header}\n"
-        f"Заявок: {len(steps)}\n"
-        f"Пробег: ~{route.get('route_km', 0):.1f} км\n\n"
-        + "\n".join(lines)
-    )
+            lon = lat = None
+            if row_idx in coords_cache:
+                lon, lat = coords_cache[row_idx]
+                if lat and lon:
+                    route_points.append((lat, lon))
 
-    # ограничиваем длину сообщения для Telegram
-    if len(route_text) > 3800:
-        route_text = route_text[:3790] + "\n…(сокращено)"
+            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+            lines.append(f"• №{info.get('order_no', jid)} — {addr}" + (f" (ETA {eta_str})" if eta_str else ""))
 
-    kb_rows = []
-    for s in steps:
-        jid = int(s["job"])
-        info = job_info.get(jid, {})
-        order_no = info.get("order_no", jid)
-        kb_rows.append([
-            InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"remove:{vid}:{jid}"),
-            InlineKeyboardButton(f"🔄 Передать", callback_data=f"transfer:{vid}:{jid}")
-        ])
-    kb_rows.append([InlineKeyboardButton("🗺 Открыть маршрут", url=route_url)])
-    kb_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"recalc:{vid}")])
+        # ссылка на карту
+        if route_points:
+            wh_lat = float(WAREHOUSE_LAT)
+            wh_lon = float(WAREHOUSE_LON)
+            gmaps_url = build_google_maps_multistop([(wh_lat, wh_lon)] + route_points + [(wh_lat, wh_lon)])
+        else:
+            gmaps_url = "https://maps.google.com"
 
-    await query.edit_message_text(route_text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        text = (
+            f"✏️ Редактирование маршрута: {header}\n\n"
+            f"Заявок: {len(steps)}\n"
+            f"Пробег: ~{route.get('route_km', 0.0):.1f} км\n\n"
+            + "\n".join(lines)
+        )
+        if len(text) > 3900:
+            text = text[:3900] + "\n…(сокращено)"
+
+        # Клавиатура
+        kb_rows = []
+        for s in steps:
+            jid = int(s["job"])
+            order_no = job_info.get(jid, {}).get("order_no", jid)
+            kb_rows.append([
+                InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"remove:{vid}:{jid}"),
+                InlineKeyboardButton("🔄 Передать", callback_data=f"transfer:{vid}:{jid}")
+            ])
+        kb_rows.append([InlineKeyboardButton("🗺 Посмотреть маршрут", url=gmaps_url)])
+        kb_rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"recalc:{vid}")])
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+    except Exception as e:
+        logger.exception(f"Ошибка в start_editing_route для vid={vid}: {e}")
+        await query.edit_message_text("⚠️ Ошибка при открытии маршрута. Подробности уже в логах Railway.")
 
 async def transfer_route(update: Update, context: ContextTypes.DEFAULT_TYPE, vid: int, jid: int):
     """Передача заявки другому водителю (фикс фильтра и нормальный список кнопок)"""
