@@ -1965,61 +1965,63 @@ async def edit_transfer_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await query.edit_message_text(f"⚠️ Ошибка при отправке маршрута: {e}")
 
-# === ПЕРЕДАЧА ВСЕГО МАРШРУТА ===
+# === ПЕРЕДАЧА ВСЕГО МАРШРУТА (упрощённая и безопасная версия) ===
 
 async def edit_transfer_whole_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список водителей для передачи всего маршрута."""
     query = update.callback_query
     await query.answer()
-    _, route_id = query.data.split(":")
+    _, route_id = query.data.split(":", 1)
     route = routes_cache.get(route_id)
-
     if not route:
         await query.edit_message_text("⚠️ Маршрут не найден.")
         return
 
-    ws = client.open(SHEET_NAME).worksheet("Водители")
-    records = ws.get_all_records()
+    # читаем таблицу Водители
+    try:
+        ws = client.open(SHEET_NAME).worksheet("Водители")
+        records = ws.get_all_records()
+    except Exception as e:
+        await query.edit_message_text(f"Ошибка чтения листа 'Водители': {e}")
+        return
+
     kb = []
     for r in records:
-        car = str(r.get("Гос номер", "")).strip()
-        drv = r.get("ФИО", "") or car
+        drv = str(r.get("ФИО", "")).strip() or str(r.get("Гос номер", "")).strip()
         tg = str(r.get("telegram id", "")).strip()
         if tg:
-            kb.append([InlineKeyboardButton(f"{drv} ({car})", callback_data=f"edit_transfer_whole_confirm:{route_id}:{tg}")])
+            kb.append([InlineKeyboardButton(f"{drv}", callback_data=f"edit_transfer_whole_confirm:{route_id}:{tg}")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_done")])
 
-    await query.edit_message_text("🚚 Кому передать весь маршрут:", reply_markup=InlineKeyboardMarkup(kb))
+    await query.edit_message_text("Выберите водителя для передачи маршрута:", reply_markup=InlineKeyboardMarkup(kb))
+
 
 async def edit_transfer_whole_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Передаёт весь маршрут выбранному водителю."""
     query = update.callback_query
     await query.answer()
-    _, route_id, tg_id = query.data.split(":")
-    tg_id = int(tg_id)
+    _, route_id, tg_id = query.data.split(":", 2)
     route = routes_cache.get(route_id)
     if not route:
         await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    steps = route.get("steps", [])
+    if not steps:
+        await query.edit_message_text("⚠️ Маршрут пуст.")
         return
 
     store = context.application.bot_data
     job_info = store.get("job_info", {})
-    steps = route["steps"]
 
-    if not steps:
-        await query.edit_message_text("⚠️ В маршруте нет заявок.")
-        return
-
-    text = "🚛 Новый маршрут полностью для вас:\n\n" + "\n".join(
+    text = "🚚 Новый маршрут для вас:\n\n" + "\n".join(
         f"• №{job_info.get(int(s['job']),{}).get('order_no',s['job'])} — {job_info.get(int(s['job']),{}).get('addr','')}"
         for s in steps
     )
 
     try:
-        await context.bot.send_message(chat_id=tg_id, text=text)
-        await query.edit_message_text("✅ Весь маршрут передан выбранному водителю.")
+        await context.bot.send_message(chat_id=int(tg_id), text=text)
+        await query.edit_message_text("✅ Маршрут полностью передан выбранному водителю.")
     except Exception as e:
-        await query.edit_message_text(f"⚠️ Ошибка при отправке маршрута: {e}")
+        await query.edit_message_text(f"⚠️ Ошибка при отправке: {e}")
 
 async def edit_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
