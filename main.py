@@ -1028,6 +1028,13 @@ def ors_optimize(jobs, vehicles):
     logger.debug("📤 Payload в ORS:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
 
     # --- запрос в ORS ---
+    print(type(payload))
+    print(len(json.dumps(payload)) / 1024, "KB")
+    print(payload.keys())
+
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     return r.json()
