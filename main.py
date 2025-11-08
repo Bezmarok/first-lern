@@ -2038,13 +2038,14 @@ if __name__ == "__main__":
 
     app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
-    app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
     app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
     app.add_handler(CallbackQueryHandler(edit_transfer_whole_route, pattern=r"^edit_transfer_whole:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_whole_confirm, pattern=r"^edit_transfer_whole_confirm:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
+    app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
     # Кнопки (callback_data)
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(earnings, pattern="^earnings$"))
 
     # Файлы Excel
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
