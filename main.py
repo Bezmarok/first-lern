@@ -1880,13 +1880,13 @@ async def open_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addr = info.get("addr", "Без адреса")
         lines.append(f"• №{info.get('order_no', jid)} — {addr}")
 
-    kb.append([InlineKeyboardButton("📦 Передать весь маршрут", callback_data=f"edit_transfer_whole:{route_id}")])
-
     kb = []
+    kb.append([InlineKeyboardButton("📦 Передать весь маршрут", callback_data=f"edit_transfer_whole:{route_id}")])
     for i, s in enumerate(steps):
         jid = int(s["job"])
         order_no = job_info.get(jid, {}).get("order_no", jid)
         kb.append([InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"edit_del:{route_id}:{jid}")])
+        
     kb.append([InlineKeyboardButton("📤 Передать маршрут", callback_data=f"edit_transfer:{route_id}")])
     kb.append([InlineKeyboardButton("✅ Завершить", callback_data="edit_done")])
 
