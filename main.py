@@ -1619,12 +1619,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Маршрут назначен: {drv.get('description','')} {drv.get('car_plate','')}")
         return
 
-    # === Редактирование маршрута ===
-    if data.startswith("edit:"):
-        vid = int(data.split(":")[1])
-        await start_editing_route(update, context, vid)
-        return
-
     # === Удаление заявки из маршрута с пересборкой текста ===
     if data.startswith("remove:"):
         try:
@@ -2054,7 +2048,7 @@ if __name__ == "__main__":
     # Общий текст: регистрация водителей. ВАЖНО исключить админа
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
-    app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit_route:"))
+    app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
