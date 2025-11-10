@@ -733,11 +733,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-    logger.error(f"Ошибка обработки файла: {e}")
-    await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
+        logger.error(f"Ошибка обработки файла: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
 
 
-
+# === Универсальный парсер даты ===
 def try_parse_datetime(val):
     """Пробует распарсить дату в любом нормальном виде."""
     if not val:
