@@ -733,8 +733,27 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        logger.error(f"Ошибка обработки файла: {e}")
-        await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
+    logger.error(f"Ошибка обработки файла: {e}")
+    await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
+
+
+
+def try_parse_datetime(val):
+    """Пробует распарсить дату в любом нормальном виде."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, date):
+        return datetime.combine(val, datetime.min.time())
+
+    text = str(val).strip()
+    for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            pass
+    return None
 
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
 def build_jobs_from_sheet(rows, start_row_idx=2):
@@ -1182,8 +1201,11 @@ async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if status != "выполнено":
                 continue
             dt = try_parse_datetime(row.get("Факт Дата и время")) or try_parse_datetime(row.get("Время обновления"))
-            if not dt or dt.date() != now.date():
+            if not dt:
                 continue
+            if abs((now.date() - dt.date()).days) > 0:
+                continue
+
             price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".") or 0)
             coef = coef_by_id.get(driver_id, 1.0)
             summary[driver_id]["sum"] += price
