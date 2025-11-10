@@ -1715,7 +1715,7 @@ async def choose_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, rout
     await query.edit_message_text("Выберите водителя для маршрута:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str, tg_id: str, car_plate: str):
-    """После выбора водителя — передаёт ему маршрут."""
+    """После выбора водителя — передаёт ему маршрут через стандартную функцию с кнопками и расчётами."""
     query = update.callback_query
     await query.answer()
 
@@ -1727,14 +1727,20 @@ async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("⚠️ Маршрут не найден.")
         return
 
-    steps = route["steps"]
-    text = "🧭 Ваш маршрут:\n\n" + "\n".join(
-        f"• №{job_info.get(int(s['job']),{}).get('order_no',s['job'])} — {job_info.get(int(s['job']),{}).get('addr','')}"
-        for s in steps
-    )
+    # добавляем маршрут в общий кэш, как будто его сгенерировал оптимизатор
+    routes_by_vehicle = context.application.bot_data.setdefault("routes_by_vehicle", {})
+    routes_by_vehicle[int(tg_id)] = {
+        "steps": route["steps"],
+        "route_km": route["route_km"],
+        "total_vol": route["total_vol"],
+        "total_wgt": route["total_wgt"],
+        "total_price": route["total_price"],
+        "driver_plate": car_plate,
+    }
 
+    # используем уже готовую функцию, чтобы всё с кнопками и расчётами отправилось корректно
     try:
-        await context.bot.send_message(chat_id=int(tg_id), text=text)
+        await send_route_to_driver(context, int(tg_id))
         await query.edit_message_text(f"✅ Маршрут передан водителю {car_plate} (id={tg_id}).")
     except Exception as e:
         await query.edit_message_text(f"⚠️ Ошибка при передаче маршрута: {e}")
