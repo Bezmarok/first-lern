@@ -1277,9 +1277,9 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
     """
-    Строит маршруты и шлёт администратору сводки.
-    Данные складываются в application.bot_data.
-    Возвращает True при успехе, False при любой проблеме.
+    Строит маршруты без назначения водителя.
+    Админ получает список маршрутов и кнопку "Назначить водителя".
+    После выбора водителя маршрут передаётся ему.
     """
     try:
         rows = sheet.get_all_records()
@@ -1302,14 +1302,6 @@ async def optimize_and_assign(bot, context=None):
         await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации (все назначены/выполнены или без адреса).")
         return False
 
-    # Мягкие предупреждения, но без остановки
-    warn_msgs = []
-    if len(jobs) > 200:  warn_msgs.append(f"много заявок: {len(jobs)}")
-    if len(vehicles) > 20: warn_msgs.append(f"много машин: {len(vehicles)}")
-    if warn_msgs:
-        await bot.send_message(chat_id=ADMIN_ID, text="⚠️ Внимание: " + ", ".join(warn_msgs) + ". Считаю.")
-
-    # Оптимизация
     try:
         solution = ors_optimize(jobs, vehicles)
     except Exception as e:
@@ -1320,58 +1312,47 @@ async def optimize_and_assign(bot, context=None):
     unassigned_raw = solution.get("unassigned", [])
     unassigned_ids = extract_unassigned_ids(unassigned_raw)
 
-    routes_by_vehicle = {}
-    for r in routes:
-        vid = int(r["vehicle"])
-        steps = [s for s in r.get("steps", []) if s.get("type") == "job"]
-        route_dist_km = float(r.get("distance", 0)) / 1000.0
-        routes_by_vehicle[vid] = {"steps": steps, "route_km": route_dist_km}
-    for v in vehicles:
-        routes_by_vehicle.setdefault(v["id"], {"steps": [], "route_km": 0.0})
-
-    # Сохранение в application.bot_data
+    # сохраняем всё в память
     if context:
         store = context.application.bot_data
-        store["routes_by_vehicle"] = routes_by_vehicle
+        store["routes_raw"] = routes
         store["job_info"] = job_info
         store["rows"] = rows
         store["row_index_by_job_id"] = row_index_by_job_id
-        store["vehicles"] = {int(v["id"]): v for v in vehicles}
         store["coords_cache"] = coords_cache
+        store["vehicles"] = {int(v["id"]): v for v in vehicles}
 
-    # Цена из строки (поддержка двух возможных заголовков)
-    def _price_from_row(r: dict) -> float:
-        for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
-            if key in r and r[key] not in (None, ""):
+    # формируем маршруты без водителя
+    for i, route in enumerate(routes, start=1):
+        steps = [s for s in route.get("steps", []) if s.get("type") == "job"]
+        route_id = f"route_{i}"
+        total_km = float(route.get("distance", 0)) / 1000.0
+
+        total_vol = sum(job_info[int(s["job"])]["vol_m3"] for s in steps if int(s["job"]) in job_info)
+        total_wgt = sum(job_info[int(s["job"])]["wgt_kg"] for s in steps if int(s["job"]) in job_info)
+
+        def _price_from_row(r: dict) -> float:
+            for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
+                if key in r and r[key] not in (None, ""):
+                    try:
+                        return float(str(r[key]).replace(",", "."))
+                    except Exception:
+                        pass
+            return 0.0
+
+        total_price = 0.0
+        lines = []
+        for s in steps:
+            jid = int(s["job"])
+            info = job_info.get(jid, {})
+            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+            price_val = 0.0
+            row_idx = row_index_by_job_id.get(jid)
+            if row_idx:
                 try:
-                    return float(str(r[key]).replace(",", "."))
+                    price_val = _price_from_row(rows[row_idx - 2])
                 except Exception:
-                    pass
-        return 0.0
-
-    # Сообщение админу по каждому водителю
-    for vid, data in routes_by_vehicle.items():
-        drv = next((d for d in vehicles if d["id"] == vid), None)
-        if not drv:
-            continue
-
-        job_steps = data["steps"]
-        total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
-        total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
-
-        total_price = 0.0
-        lines = []
-        for s in job_steps:
-            jid = int(s["job"])
-            info = job_info.get(jid, {})
-            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-            price_val = 0.0
-            try:
-                row_idx = context.application.bot_data["row_index_by_job_id"].get(jid)
-                if row_idx:
-                    price_val = _price_from_row(rows[row_idx - 2])
-            except Exception:
-                price_val = 0.0
+                    price_val = 0.0
             total_price += price_val
             lines.append(
                 f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
@@ -1379,75 +1360,37 @@ async def optimize_and_assign(bot, context=None):
                 + (f" | {price_val:.2f} ₽" if price_val else "")
             )
 
-        header = f"{drv.get('description','')}" + (f" | {drv.get('car_plate','')}" if drv.get("car_plate") else "")
-        route_text  = f"🚚 Маршрут для {header}\n"
-        route_text += f"Заявок: {len(job_steps)}\n"
-        route_text += f"Итого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг\n"
-        route_text += f"Пробег: ~{data['route_km']:.1f} км\n"
-        route_text += f"Сумма заказов: {total_price:.2f} ₽\n\n"
-        route_text += ("\n".join(lines) if lines else "Заявок нет")
+        # сохраняем маршрут без привязки к водителю
+        if context:
+            context.application.bot_data.setdefault("routes_unassigned", {})[route_id] = {
+                "steps": steps,
+                "route_km": total_km,
+                "total_vol": total_vol,
+                "total_wgt": total_wgt,
+                "total_price": total_price,
+            }
+
+        text = (
+            f"🚚 Маршрут #{i}\n"
+            f"Заявок: {len(steps)}\n"
+            f"Итого: объём {total_vol:.1f} м³ / вес {total_wgt:.1f} кг\n"
+            f"Пробег: ~{total_km:.1f} км\n"
+            f"Сумма заказов: {total_price:.2f} ₽\n\n"
+            + ("\n".join(lines) if lines else "Заявок нет")
+        )
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Назначить {header}", callback_data=f"assign:{vid}")],
-            [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
-            [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
+            [InlineKeyboardButton("✅ Назначить водителя", callback_data=f"choose_driver:{route_id}")],
+            [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit_unassigned:{route_id}")],
         ])
-        await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
+        await bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=kb)
 
     if unassigned_ids:
-        await bot.send_message(chat_id=ADMIN_ID,
+        await bot.send_message(
+            chat_id=ADMIN_ID,
             text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
-                 f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})")
-    return True
-
-    # Сообщение админу по каждому водителю
-    for vid, data in routes_by_vehicle.items():
-        drv = next((d for d in vehicles if d["id"] == vid), None)
-        if not drv:
-            continue
-
-        job_steps = data["steps"]
-        total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in job_steps if int(s["job"]) in job_info)
-        total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in job_steps if int(s["job"]) in job_info)
-
-        total_price = 0.0
-        lines = []
-        for s in job_steps:
-            jid = int(s["job"])
-            info = job_info.get(jid, {})
-            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-            price_val = 0.0
-            try:
-                row_idx = store["row_index_by_job_id"].get(jid)
-                if row_idx:
-                    price_val = _price_from_row(rows[row_idx - 2])
-            except Exception:
-                price_val = 0.0
-            total_price += price_val
-            lines.append(
-                f"• №{info.get('order_no', jid)} — {info.get('addr', '')}"
-                + (f" (ETA {eta_str})" if eta_str else "")
-                + (f" | {price_val:.2f} ₽" if price_val else "")
-            )
-
-        route_text  = f"🚚 Маршрут для {drv.get('description','')}\n"
-        route_text += f"Заявок: {len(job_steps)}\n"
-        route_text += f"Итого: объём {total_vol_m3:.1f} м³ / вес {total_wgt_kg:.1f} кг\n"
-        route_text += f"Пробег: ~{data['route_km']:.1f} км\n"
-        route_text += f"Сумма заказов: {total_price:.2f} ₽\n\n"
-        route_text += "\n".join(lines) if lines else "Заявок нет"
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Назначить водителю", callback_data=f"assign:{vid}")],
-            [InlineKeyboardButton("✏️ Редактировать маршрут", callback_data=f"edit:{vid}")],
-            [InlineKeyboardButton("⏸ Отложить", callback_data=f"skip:{vid}")]
-        ])
-        await bot.send_message(chat_id=ADMIN_ID, text=route_text, reply_markup=kb)
-
-    if unassigned_ids:
-        await bot.send_message(chat_id=ADMIN_ID,
-            text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
-                 f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})")
+                 f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})"
+        )
     return True
 
 # === ОБРАБОТЧИК КНОПОК ===
@@ -1684,12 +1627,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Не удалось удалить заказ.")
         return
 
-    # === Передача заявки другому водителю ===
-    if data.startswith("transfer:"):
-        _, vid_str, jid_str = data.split(":")
-        vid, jid = int(vid_str), int(jid_str)
-        await transfer_route(update, context, vid, jid)
-        return
+    async def choose_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str):
+    """Показывает список водителей для назначения маршрута."""
+    query = update.callback_query
+    await query.answer()
+
+    ws = client.open(SHEET_NAME).worksheet("Водители")
+    records = ws.get_all_records()
+
+    kb = []
+    for r in records:
+        car = str(r.get("Гос номер", "")).strip()
+        tg = str(r.get("telegram id", "")).strip()
+        if not tg:
+            continue
+        label = f"{car or 'Без номера'} ({r.get('принадлежность', '')})"
+        kb.append([InlineKeyboardButton(label, callback_data=f"confirm_assign_driver:{route_id}:{tg}:{car}")])
+
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")])
+    await query.edit_message_text("Выберите водителя для маршрута:", reply_markup=InlineKeyboardMarkup(kb))
 
     # === Подтверждение передачи заявки ===
     if data.startswith("confirm_transfer:"):
@@ -1757,6 +1713,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка отметки статуса: {e}")
             await query.edit_message_text("⚠️ Не удалось записать статус в таблицу.")
         return
+
+async def choose_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str):
+    """Показывает список водителей для назначения маршрута."""
+    query = update.callback_query
+    await query.answer()
+
+    ws = client.open(SHEET_NAME).worksheet("Водители")
+    records = ws.get_all_records()
+
+    kb = []
+    for r in records:
+        car = str(r.get("Гос номер", "")).strip()
+        tg = str(r.get("telegram id", "")).strip()
+        if not tg:
+            continue
+        label = f"{car or 'Без номера'} ({r.get('принадлежность', '')})"
+        kb.append([InlineKeyboardButton(label, callback_data=f"confirm_assign_driver:{route_id}:{tg}:{car}")])
+
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")])
+    await query.edit_message_text("Выберите водителя для маршрута:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str, tg_id: str, car_plate: str):
+    """После выбора водителя — передаёт ему маршрут."""
+    query = update.callback_query
+    await query.answer()
+
+    routes = context.application.bot_data.get("routes_unassigned", {})
+    job_info = context.application.bot_data.get("job_info", {})
+    route = routes.get(route_id)
+
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    steps = route["steps"]
+    text = "🧭 Ваш маршрут:\n\n" + "\n".join(
+        f"• №{job_info.get(int(s['job']),{}).get('order_no',s['job'])} — {job_info.get(int(s['job']),{}).get('addr','')}"
+        for s in steps
+    )
+
+    try:
+        await context.bot.send_message(chat_id=int(tg_id), text=text)
+        await query.edit_message_text(f"✅ Маршрут передан водителю {car_plate} (id={tg_id}).")
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Ошибка при передаче маршрута: {e}")
+
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ===
 routes_by_vehicle = {}   # глобально храним маршруты после оптимизации
@@ -2055,5 +2058,13 @@ if __name__ == "__main__":
 
     # Общий текст: регистрация водителей. ВАЖНО исключить админа
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
+    app.add_handler(CallbackQueryHandler(
+    lambda u, c: choose_driver(u, c, u.callback_query.data.split(':')[1]),
+    pattern=r"^choose_driver:"
+))
+app.add_handler(CallbackQueryHandler(
+    lambda u, c: confirm_assign_driver(u, c, *u.callback_query.data.split(':')[1:]),
+    pattern=r"^confirm_assign_driver:"
+))
 
     app.run_polling()
