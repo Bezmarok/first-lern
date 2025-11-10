@@ -1105,7 +1105,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif "итог" in text:
-        await daily_summary(update, context)
+        await earnings(update, context)
         return
 
     elif "excel" in text or "загруз" in text:
@@ -1149,27 +1149,65 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Для водителя: считает заработок за текущие сутки по его ID.
-    Учитывает только заявки со статусом 'выполнено' и умножает сумму на коэффициент из листа 'Водители'.
+    Универсальная функция:
+      • если обращается админ — показывает сводку по всем водителям (итоги дня);
+      • если водитель — показывает личный заработок за сегодня.
     """
     user_id = update.effective_user.id
+    now = datetime.now()
+
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
         ws_drivers = client.open(SHEET_NAME).worksheet("Водители")
-    except Exception as e:
-        logger.error(f"Ошибка доступа к листам: {e}")
-        await update.message.reply_text("⚠️ Ошибка доступа к данным. Попробуйте позже.")
-        return
-
-    try:
         orders = ws_orders.get_all_records()
         drivers = ws_drivers.get_all_records()
     except Exception as e:
-        logger.error(f"Ошибка чтения таблицы: {e}")
-        await update.message.reply_text("⚠️ Не удалось прочитать таблицу.")
+        logger.error(f"Ошибка чтения таблиц: {e}")
+        await update.message.reply_text("⚠️ Не удалось прочитать таблицы.")
         return
 
-    # Поиск водителя по Telegram ID или ID в таблице
+    # === АДМИН: сводка по всем ===
+    if user_id == ADMIN_ID:
+        summary = defaultdict(lambda: {"sum": 0.0, "coef": 1.0, "count": 0})
+        coef_by_id = {
+            str(d.get("id", "")).strip(): float(str(d.get("Коэффициент", "1")).replace(",", ".") or 1)
+            for d in drivers if str(d.get("id", "")).strip()
+        }
+
+        for row in orders:
+            driver_id = str(row.get("id", "")).strip()
+            if not driver_id:
+                continue
+            status = str(row.get("Статус", "")).strip().lower()
+            if status != "выполнено":
+                continue
+            dt = try_parse_datetime(row.get("Факт Дата и время")) or try_parse_datetime(row.get("Время обновления"))
+            if not dt or dt.date() != now.date():
+                continue
+            price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".") or 0)
+            coef = coef_by_id.get(driver_id, 1.0)
+            summary[driver_id]["sum"] += price
+            summary[driver_id]["coef"] = coef
+            summary[driver_id]["count"] += 1
+
+        if not summary:
+            await update.message.reply_text("📊 За сегодня выполненных заявок нет.")
+            return
+
+        lines = []
+        total_all = 0.0
+        for drv_id, data in summary.items():
+            total_with_coef = data["sum"] * data["coef"]
+            total_all += total_with_coef
+            lines.append(
+                f"🚚 ID {drv_id}: {data['count']} заявок, {data['sum']:.2f} ₽ × {data['coef']} = {total_with_coef:.2f} ₽"
+            )
+
+        msg = "📊 Итоги дня:\n" + "\n".join(lines) + f"\n\nИтого по всем: {total_all:.2f} ₽"
+        await update.message.reply_text(msg)
+        return
+
+    # === ВОДИТЕЛЬ: личный заработок ===
     driver_row = next(
         (d for d in drivers if str(d.get("telegram id", "")).strip() == str(user_id) or str(d.get("id", "")).strip() == str(user_id)),
         None
@@ -1180,9 +1218,8 @@ async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     coef = float(str(driver_row.get("Коэффициент", "1")).replace(",", ".") or 1)
     driver_id = str(driver_row.get("id", "")).strip() or str(user_id)
-    now = datetime.now()
-
     total_today = 0.0
+    completed = 0
 
     for row in orders:
         if str(row.get("id", "")).strip() != driver_id:
@@ -1195,15 +1232,16 @@ async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".") or 0)
         total_today += price
+        completed += 1
 
     total_with_coef = total_today * coef
     msg = (
         f"💰 Ваш заработок за {now.strftime('%d.%m.%Y')}:\n"
-        f"Заявок выполнено: {len([r for r in orders if str(r.get('id','')).strip() == driver_id and str(r.get('Статус','')).strip().lower() == 'выполнено' and try_parse_datetime(r.get('Факт Дата и время')) and try_parse_datetime(r.get('Факт Дата и время')).date() == now.date()])}\n"
+        f"Заявок выполнено: {completed}\n"
         f"Сумма заявок: {total_today:.2f} ₽\n"
-        f"Итого: {total_with_coef:.2f} ₽"
+        f"С учётом коэффициента {coef} → *{total_with_coef:.2f} ₽*"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     rows = [[
@@ -1220,8 +1258,9 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Для администратора: считает итоги по всем водителям за текущие сутки.
     Берет только выполненные заявки, суммирует по ID водителя и умножает на индивидуальный коэффициент из листа 'Водители'.
     """
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if data == "summary":
+    await earnings(update, context)
+    return
 
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
