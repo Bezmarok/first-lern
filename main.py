@@ -1258,9 +1258,10 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Для администратора: считает итоги по всем водителям за текущие сутки.
     Берет только выполненные заявки, суммирует по ID водителя и умножает на индивидуальный коэффициент из листа 'Водители'.
     """
+    # === Итоги дня (универсальная версия) ===
     if data == "summary":
-    await earnings(update, context)
-    return
+        await earnings(update, context)
+        return
 
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
