@@ -6,7 +6,7 @@ import os
 import json
 import re
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from collections import defaultdict
 from math import radians, sin, cos, asin, sqrt
 from urllib.parse import quote
