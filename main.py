@@ -1627,26 +1627,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Не удалось удалить заказ.")
         return
 
-    async def choose_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str):
-    """Показывает список водителей для назначения маршрута."""
-    query = update.callback_query
-    await query.answer()
-
-    ws = client.open(SHEET_NAME).worksheet("Водители")
-    records = ws.get_all_records()
-
-    kb = []
-    for r in records:
-        car = str(r.get("Гос номер", "")).strip()
-        tg = str(r.get("telegram id", "")).strip()
-        if not tg:
-            continue
-        label = f"{car or 'Без номера'} ({r.get('принадлежность', '')})"
-        kb.append([InlineKeyboardButton(label, callback_data=f"confirm_assign_driver:{route_id}:{tg}:{car}")])
-
-    kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")])
-    await query.edit_message_text("Выберите водителя для маршрута:", reply_markup=InlineKeyboardMarkup(kb))
-
     # === Подтверждение передачи заявки ===
     if data.startswith("confirm_transfer:"):
         try:
@@ -1733,7 +1713,7 @@ async def choose_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, rout
 
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")])
     await query.edit_message_text("Выберите водителя для маршрута:", reply_markup=InlineKeyboardMarkup(kb))
-
+    return
 
 async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TYPE, route_id: str, tg_id: str, car_plate: str):
     """После выбора водителя — передаёт ему маршрут."""
@@ -1759,7 +1739,7 @@ async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"✅ Маршрут передан водителю {car_plate} (id={tg_id}).")
     except Exception as e:
         await query.edit_message_text(f"⚠️ Ошибка при передаче маршрута: {e}")
-
+        return
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ===
 routes_by_vehicle = {}   # глобально храним маршруты после оптимизации
