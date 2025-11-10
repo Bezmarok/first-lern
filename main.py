@@ -2038,11 +2038,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
     app.add_handler(CallbackQueryHandler(
     lambda u, c: choose_driver(u, c, u.callback_query.data.split(':')[1]),
-    pattern=r"^choose_driver:"
-))
-app.add_handler(CallbackQueryHandler(
+    pattern=r"^choose_driver:"))
+    app.add_handler(CallbackQueryHandler(
     lambda u, c: confirm_assign_driver(u, c, *u.callback_query.data.split(':')[1:]),
-    pattern=r"^confirm_assign_driver:"
-))
+    pattern=r"^confirm_assign_driver:"))
 
-    app.run_polling()
+app.run_polling()
