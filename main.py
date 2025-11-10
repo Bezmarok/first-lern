@@ -1727,7 +1727,7 @@ async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("⚠️ Маршрут не найден.")
         return
 
-    # добавляем маршрут в общий кэш, как будто его сгенерировал оптимизатор
+    # добавляем маршрут в общий кэш, чтобы итоги и расчёты знали про него
     routes_by_vehicle = context.application.bot_data.setdefault("routes_by_vehicle", {})
     routes_by_vehicle[int(tg_id)] = {
         "steps": route["steps"],
@@ -1736,9 +1736,15 @@ async def confirm_assign_driver(update: Update, context: ContextTypes.DEFAULT_TY
         "total_wgt": route["total_wgt"],
         "total_price": route["total_price"],
         "driver_plate": car_plate,
+        "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "completed_jobs": [],   # важно для /summary
+        "earnings": 0.0         # сюда запишется, когда водитель отметит "выполнено"
     }
 
-    # используем уже готовую функцию, чтобы всё с кнопками и расчётами отправилось корректно
+    # сохраняем изменения
+    context.application.bot_data["routes_by_vehicle"] = routes_by_vehicle
+
+    # теперь отправляем маршрут через стандартную функцию, чтобы появились кнопки и расчёты
     try:
         await send_route_to_driver(context, int(tg_id))
         await query.edit_message_text(f"✅ Маршрут передан водителю {car_plate} (id={tg_id}).")
