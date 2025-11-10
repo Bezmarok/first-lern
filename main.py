@@ -2012,11 +2012,12 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Команды
+       # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("earnings", earnings))
     app.add_handler(CommandHandler("summary", daily_summary))
 
+    # === Хендлеры редактирования маршрутов ===
     app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
     app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
@@ -2024,23 +2025,26 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(edit_transfer_whole_confirm, pattern=r"^edit_transfer_whole_confirm:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
-    # Кнопки (callback_data)
+
+    # === Выбор и назначение водителя (должно идти ДО button_handler) ===
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: choose_driver(u, c, u.callback_query.data.split(':')[1]),
+        pattern=r"^choose_driver:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: confirm_assign_driver(u, c, *u.callback_query.data.split(':')[1:]),
+        pattern=r"^confirm_assign_driver:"
+    ))
+
+    # === Общие кнопки ===
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CallbackQueryHandler(earnings, pattern="^earnings$"))
 
-    # Файлы Excel
+    # === Файлы Excel ===
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
-    # Меню админа (ДОЛЖНО идти раньше общего текстового)
+    # === Меню админа и водителей ===
     app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), handle_admin_menu))
-
-    # Общий текст: регистрация водителей. ВАЖНО исключить админа
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
-    app.add_handler(CallbackQueryHandler(
-    lambda u, c: choose_driver(u, c, u.callback_query.data.split(':')[1]),
-    pattern=r"^choose_driver:"))
-    app.add_handler(CallbackQueryHandler(
-    lambda u, c: confirm_assign_driver(u, c, *u.callback_query.data.split(':')[1:]),
-    pattern=r"^confirm_assign_driver:"))
 
-app.run_polling()
+    app.run_polling()
