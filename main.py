@@ -1091,9 +1091,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=markup
         )
     else:
-    # Меню для водителя (только заработок)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
+        # Меню для водителя (только заработок)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
     ])
     await update.message.reply_text(
         "Укажи параметры машины, например:\n"
