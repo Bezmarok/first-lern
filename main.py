@@ -6,7 +6,7 @@ import os
 import json
 import re
 import tempfile
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import pytz
 from collections import defaultdict
 from math import radians, sin, cos, asin, sqrt
@@ -1164,141 +1164,89 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Универсальная функция:
-      • если обращается админ — показывает сводку по всем водителям (итоги дня);
-      • если водитель — показывает личный заработок за сегодня.
+    Для водителя: считает заработок за последние 24 часа по его ID.
+    Учитывает только заявки со статусом 'выполнено' и умножает сумму на коэффициент из листа 'Водители'.
     """
+    from datetime import datetime, timedelta, timezone
+
     user_id = update.effective_user.id
-    now = datetime.now()
-
-    def safe_float(val, default=0.0):
-        if val is None:
-            return default
-        try:
-            if isinstance(val, (int, float)):
-                return float(val)
-            s = str(val).strip().replace(",", ".").replace("\u00a0", "").replace(" ", "")
-            return float(re.match(r"^-?\d+(\.\d+)?", s).group(0)) if re.match(r"^-?\d+(\.\d+)?", s) else default
-        except Exception:
-            return default
-
-    def normalize_id(val):
-        return str(val or "").strip().lower()
-
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
         ws_drivers = client.open(SHEET_NAME).worksheet("Водители")
+    except Exception as e:
+        logger.error(f"Ошибка доступа к листам: {e}")
+        await update.message.reply_text("⚠️ Ошибка доступа к данным. Попробуйте позже.")
+        return
+
+    try:
         orders = ws_orders.get_all_records()
         drivers = ws_drivers.get_all_records()
     except Exception as e:
-        logger.error(f"Ошибка чтения таблиц: {e}")
-        await update.message.reply_text("⚠️ Не удалось прочитать таблицы.")
+        logger.error(f"Ошибка чтения таблицы: {e}")
+        await update.message.reply_text("⚠️ Не удалось прочитать таблицу.")
         return
 
-    # === Админ: сводка по всем ===
-    if user_id == ADMIN_ID:
-        summary = defaultdict(lambda: {"sum": 0.0, "coef": 1.0, "count": 0})
-
-        # Индекс коэффициентов по ID (гибкий поиск)
-        coef_by_id = {}
-        for d in drivers:
-            drv_id = normalize_id(d.get("id") or d.get("ID") or d.get("telegram id") or d.get("Telegram ID"))
-            if not drv_id:
-                continue
-            coef_by_id[drv_id] = safe_float(d.get("Коэффициент") or d.get("коэффициент") or 1.0, 1.0)
-
-        for row in orders:
-            driver_id = normalize_id(row.get("id") or row.get("ID") or row.get("telegram id") or row.get("Telegram ID"))
-            if not driver_id:
-                continue
-
-            status = str(row.get("Статус", "")).strip().lower()
-            if status != "выполнено":
-                continue
-
-            # Надёжное определение даты
-            dt_val = row.get("Факт Дата и время") or row.get("Время обновления")
-            dt = try_parse_datetime(dt_val)
-            if not dt:
-                logger.debug(f"Пропуск строки: неверная дата '{dt_val}' (водитель {driver_id})")
-                continue
-            if (now - dt) > timedelta(hours=24):
-                continue
-
-            price_val = row.get("Стоимость доставки (для расчёта)") or row.get("Стоимость доставки") or 0
-            price = safe_float(price_val, 0.0)
-            if price <= 0:
-                continue
-
-            coef = coef_by_id.get(driver_id, 1.0)
-            summary[driver_id]["sum"] += price
-            summary[driver_id]["coef"] = coef
-            summary[driver_id]["count"] += 1
-
-            logger.debug(f"✅ driver={driver_id} status={status} price={price} coef={coef} dt={dt_val}")
-
-        if not summary:
-            await update.message.reply_text("📊 За сегодня выполненных заявок нет.")
-            return
-
-        lines = []
-        total_all = 0.0
-        for drv_id, data in summary.items():
-            total_with_coef = data["sum"] * data["coef"]
-            total_all += total_with_coef
-            lines.append(
-                f"🚚 ID {drv_id}: {data['count']} заявок, {data['sum']:.2f} ₽ × {data['coef']} = {total_with_coef:.2f} ₽"
-            )
-
-        msg = "📊 Итоги дня:\n" + "\n".join(lines) + f"\n\nИтого по всем: {total_all:.2f} ₽"
-        await update.message.reply_text(msg)
-        return
-
-    # === Водитель: личный заработок ===
+    # Поиск водителя по Telegram ID или ID в таблице
     driver_row = next(
-        (d for d in drivers if normalize_id(d.get("telegram id")) == str(user_id) or normalize_id(d.get("id")) == str(user_id)),
+        (d for d in drivers if str(d.get("telegram id", "")).strip() == str(user_id)
+         or str(d.get("id", "")).strip() == str(user_id)),
         None
     )
-
     if not driver_row:
         await update.message.reply_text("⚠️ Вы не зарегистрированы в системе.")
         return
 
-    coef = safe_float(driver_row.get("Коэффициент") or driver_row.get("коэффициент") or 1.0, 1.0)
-    driver_id = normalize_id(driver_row.get("id") or driver_row.get("telegram id") or user_id)
+    coef = float(str(driver_row.get("Коэффициент", "1")).replace(",", ".") or 1)
+    driver_id = str(driver_row.get("id", "")).strip() or str(user_id)
 
-    total_today = 0.0
-    completed = 0
+    # Московское время (UTC+3)
+    now = datetime.now(timezone(timedelta(hours=3)))
+    cutoff = now - timedelta(hours=24)
+
+    total_sum = 0.0
+    completed_count = 0
 
     for row in orders:
-        if normalize_id(row.get("id") or row.get("telegram id")) != driver_id:
+        # Проверяем, что это заявки данного водителя
+        if str(row.get("id", "")).strip() != driver_id:
             continue
         status = str(row.get("Статус", "")).strip().lower()
         if status != "выполнено":
             continue
 
-        dt_val = row.get("Факт Дата и время") or row.get("Время обновления")
-        dt = try_parse_datetime(dt_val)
-        if not dt or dt.date() != now.date():
+        dt = try_parse_datetime(row.get("Факт Дата и время")) or try_parse_datetime(row.get("Время обновления"))
+        if not dt:
             continue
 
-        price_val = row.get("Стоимость доставки (для расчёта)") or row.get("Стоимость доставки") or 0
-        price = safe_float(price_val, 0.0)
-        if price <= 0:
+        # Приводим время к UTC+3
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=3)))
+
+        # Только последние 24 часа
+        if dt < cutoff:
             continue
 
-        total_today += price
-        completed += 1
-        logger.debug(f"✅ driver={driver_id} выполнено {price}₽ ({dt_val})")
+        try:
+            price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".") or 0)
+        except Exception:
+            price = 0.0
 
-    total_with_coef = total_today * coef
-    msg = (
-        f"💰 Ваш заработок за {now.strftime('%d.%m.%Y')}:\n"
-        f"Заявок выполнено: {completed}\n"
-        f"Сумма заявок: {total_today:.2f} ₽\n"
-        f"С учётом коэффициента {coef} → *{total_with_coef:.2f} ₽*"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        total_sum += price
+        completed_count += 1
+
+    total_with_coef = total_sum * coef
+    if completed_count == 0:
+        msg = "📊 За последние 24 часа выполненных заявок нет."
+    else:
+        msg = (
+            f"💰 Ваш заработок за последние 24 часа:\n"
+            f"Заявок выполнено: {completed_count}\n"
+            f"Сумма заявок: {total_sum:.2f} ₽\n"
+            f"Коэффициент: {coef}\n"
+            f"Итого: {total_with_coef:.2f} ₽"
+        )
+
+    await update.message.reply_text(msg)
 
 def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     rows = [[
