@@ -1222,7 +1222,7 @@ async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not dt:
                 logger.debug(f"Пропуск строки: неверная дата '{dt_val}' (водитель {driver_id})")
                 continue
-            if dt.date() != now.date():
+            if (now - dt) > timedelta(hours=24):
                 continue
 
             price_val = row.get("Стоимость доставки (для расчёта)") or row.get("Стоимость доставки") or 0
