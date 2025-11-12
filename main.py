@@ -1170,8 +1170,8 @@ async def earnings(update, context):
     try:
         # Соединение с Google Sheets
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_name("google-credentials.json", scope)
-            client = gspread.authorize(creds)
+        creds = ServiceAccountCredentials.from_json_keyfile_name("google-credentials.json", scope)
+        client = gspread.authorize(creds)
 
         ws_orders = client.open("Cargodeliver").worksheet("Лист1")
         ws_drivers = client.open("Cargodeliver").worksheet("Водители")
