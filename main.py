@@ -6,7 +6,7 @@ import os
 import json
 import re
 import tempfile
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, timezone
 import pytz
 from collections import defaultdict
 from math import radians, sin, cos, asin, sqrt
@@ -1169,14 +1169,10 @@ async def earnings(update, context):
     """
     try:
         # Соединение с Google Sheets
-        creds = Credentials.from_service_account_file(
-            "google-credentials.json",
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
-        )
-        client = gspread.authorize(creds)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name("google-credentials.json", scope)
+            client = gspread.authorize(creds)
+
         ws_orders = client.open("Cargodeliver").worksheet("Лист1")
         ws_drivers = client.open("Cargodeliver").worksheet("Водители")
 
