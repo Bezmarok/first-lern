@@ -159,23 +159,31 @@ def now_human():
 def to_unix(dt: datetime) -> int:
     return int(dt.timestamp())
 
-def try_parse_datetime(val: str):
+def try_parse_datetime(val):
     if not val:
         return None
-    val = str(val).strip()
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, date):
+        return datetime.combine(val, datetime.min.time())
+
+    text = str(val).strip()
+
     fmts = [
-        "%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
-        "%d.%m.%Y", "%Y-%m-%d",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y",
+        "%Y-%m-%d",
     ]
-    for f in fmts:
+
+    for fmt in fmts:
         try:
-            dt = datetime.strptime(val, f)
-            if "H" not in f:
-                dt = dt.replace(hour=12, minute=0)
-            return dt
-        except Exception:
-            continue
+            return datetime.strptime(text, fmt)
+        except:
+            pass
+
     return None
 
 def parse_time_window(cell_value: str, pad_minutes: int = TIME_WINDOW_PADDING_MIN):
