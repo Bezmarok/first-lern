@@ -1296,17 +1296,17 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def get_plate(r): return (pick(r, ["гос"]) or "").strip()
 
     def get_price(r):
-    for key in [
-        "Стоимость доставки (для расчёта)",
-        "стоимость доставки (для расчёта)",
-        "Стоимость доставки",
-        "стоимость доставки",
-        "Стоимость",
-        "стоимость",
-    ]:
-        if key in r and str(r[key]).strip() not in ("", None):
-            return r[key]
-    return 0
+        for key in [
+            "Стоимость доставки (для расчёта)",
+            "стоимость доставки (для расчёта)",
+            "Стоимость доставки",
+            "стоимость доставки",
+            "Стоимость",
+            "стоимость",
+        ]:
+            if key in r and str(r[key]).strip() not in ("", None):
+                return r[key]
+        return 0
 
     def get_time(r):
         for key in ["факт дата и время", "факт", "время обновления"]:
