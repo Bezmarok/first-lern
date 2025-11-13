@@ -1269,7 +1269,7 @@ def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     return InlineKeyboardMarkup(rows)
 
 async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Рабочая версия Итогов дня. Не зависит от точных заголовков, не падает на пропусках."""
+    """Итоги дня по водителям (стабильная версия)."""
     message = update.message or update.callback_query.message
 
     try:
@@ -1285,57 +1285,47 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today = datetime.now().date()
 
-    # -----------------------------
-    #  Универсальный поиск полей
-    # -----------------------------
-    def pick(row: dict, keys: list[str]):
-        """Возвращает значение по любому из подходящих ключей."""
-        for k in row.keys():
-            kl = k.lower().strip()
-            for target in keys:
-                if target in kl:
-                    return row[k]
+    # === Универсальный поиск колонок ===
+    def pick(row, keys):
+        for k, v in row.items():
+            kl = k.lower()
+            if any(target in kl for target in keys):
+                return v
         return None
 
-    # поля заказа
-    def get_status(row):       return (pick(row, ["статус"]) or "").strip().lower()
-    def get_time(row):         return pick(row, ["факт", "время обнов", "дата вып"]) or ""
-    def get_plate(row):        return (pick(row, ["гос"]) or "").strip()
-    def get_price(row):        return pick(row, ["стоимость"]) or "0"
+    # функции-извлекатели
+    def get_status(r): return (pick(r, ["статус"]) or "").strip().lower()
+    def get_plate(r): return (pick(r, ["гос"]) or "").strip()
+    def get_price(r): return pick(r, ["стоимость"]) or "0"
+    def get_time(r):  return pick(r, ["факт", "обнов"]) or ""
 
-    # поля водителей
-    def get_drv_plate(d):      return (pick(d, ["гос"]) or "").strip()
-    def get_drv_coef(d):
-        raw = (pick(d, ["коэф"]) or "1").replace(",", ".").strip()
-        try: return float(raw)
-        except: return 1.0
-    def get_drv_name(d):
-        return (pick(d, ["фио"]) or pick(d, ["имя"]) or get_drv_plate(d)).strip()
-
-    # -----------------------------
-    #  Собираем коэффициенты
-    # -----------------------------
-    coef_by_plate = {}
-    name_by_plate = {}
+    # водители
+    plate_to_coef = {}
+    plate_to_name = {}
 
     for d in drivers:
-        plate = get_drv_plate(d)
+        plate = (pick(d, ["гос"]) or "").strip()
         if not plate:
             continue
-        coef_by_plate[plate] = get_drv_coef(d)
-        name_by_plate[plate] = get_drv_name(d)
+        coef_raw = (pick(d, ["коэф"]) or "1").replace(",", ".")
+        try:
+            coef = float(coef_raw)
+        except:
+            coef = 1.0
 
-    # -----------------------------
-    #  Считаем итоги
-    # -----------------------------
+        name = (pick(d, ["фио", "имя"]) or plate).strip()
+
+        plate_to_coef[plate] = coef
+        plate_to_name[plate] = name
+
+    # === Считаем ===
     from collections import defaultdict
-    summary = defaultdict(lambda: {"sum": 0.0, "count": 0, "coef": 1.0})
+    summary = defaultdict(lambda: {"cnt": 0, "sum": 0.0, "coef": 1.0})
 
     for row in orders:
         if get_status(row) != "выполнено":
             continue
 
-        # время выполнения
         dt_raw = get_time(row)
         dt = try_parse_datetime(dt_raw)
         if not dt or dt.date() != today:
@@ -1345,47 +1335,43 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not plate:
             continue
 
-        # стоимость
         try:
-            price = float(str(get_price(row)).replace(",", ".") or 0)
+            price = float(str(get_price(row)).replace(",", "."))
         except:
             price = 0.0
 
-        coef = coef_by_plate.get(plate, 1.0)
+        coef = plate_to_coef.get(plate, 1.0)
 
         bucket = summary[plate]
+        bucket["cnt"] += 1
         bucket["sum"] += price
-        bucket["count"] += 1
         bucket["coef"] = coef
 
-    # -----------------------------
-    #  Вывод
-    # -----------------------------
+    # === Вывод ===
     if not summary:
         await message.reply_text("📊 За сегодня выполненных заявок нет.")
         return
 
     lines = []
-    total_all = 0.0
+    total_all = 0
 
     for plate, data in summary.items():
-        total_with_coef = data["sum"] * data["coef"]
-        total_all += total_with_coef
-        name = name_by_plate.get(plate, plate)
+        final = data["sum"] * data["coef"]
+        total_all += final
+        name = plate_to_name.get(plate, plate)
 
         lines.append(
-            f"🚚 {name} ({plate}): "
-            f"{data['count']} заявок, "
-            f"{data['sum']:.2f} ₽ × {data['coef']} = {total_with_coef:.2f} ₽"
+            f"🚚 {name} ({plate}): {data['cnt']} заявок, "
+            f"{data['sum']:.2f} ₽ × {data['coef']} = {final:.2f} ₽"
         )
 
-    msg = (
-        "📊 Итоги дня по водителям:\n\n"
-        + "\n".join(lines)
-        + f"\n\nИтого по всем: {total_all:.2f} ₽"
+    text = (
+        "📊 Итоги дня:\n\n" +
+        "\n".join(lines) +
+        f"\n\nИтого по всем: {total_all:.2f} ₽"
     )
 
-    await message.reply_text(msg)
+    await message.reply_text(text)
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
