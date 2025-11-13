@@ -1120,7 +1120,8 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif "итог" in text:
-        await earnings(update, context)
+        # ВАЖНО: вызываем правильную функцию, не earnings()
+        await daily_summary(update, context)
         return
 
     elif "excel" in text or "загруз" in text:
@@ -1252,65 +1253,110 @@ def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     return InlineKeyboardMarkup(rows)
 
 async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Для администратора: считает итоги по всем водителям за текущие сутки.
-    Берет только выполненные заявки, суммирует по ID водителя и умножает на индивидуальный коэффициент из листа 'Водители'.
-    """
-    # === Итоги дня (универсальная версия) ===
-    if data == "summary":
-        await earnings(update, context)
-        return
+    """Итоги дня для админа: по всем водителям за сегодняшний день."""
 
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
         ws_drivers = client.open(SHEET_NAME).worksheet("Водители")
+
         orders = ws_orders.get_all_records()
         drivers = ws_drivers.get_all_records()
+
     except Exception as e:
-        logger.error(f"Ошибка чтения таблиц: {e}")
-        await update.message.reply_text("⚠️ Не удалось прочитать таблицы.")
+        message = update.message or update.callback_query.message
+        await message.reply_text(f"⚠️ Не удалось прочитать таблицы: {e}")
         return
 
-    now = datetime.now()
-    summary = defaultdict(lambda: {"sum": 0.0, "coef": 1.0, "count": 0})
+    today = datetime.now().date()
 
-    # индексируем коэффициенты по id
-    coef_by_id = {
-        str(d.get("id", "")).strip(): float(str(d.get("Коэффициент", "1")).replace(",", ".") or 1)
-        for d in drivers if str(d.get("id", "")).strip()
-    }
+    # ——————————————————————————————
+    # Готовим коэффициенты по госномеру
+    # ——————————————————————————————
+    coef_by_plate = {}
+    name_by_plate = {}
 
-    for row in orders:
-        driver_id = str(row.get("id", "")).strip()
-        if not driver_id:
+    for d in drivers:
+        plate = str(d.get("Гос номер", "")).strip()
+        if not plate:
             continue
+
+        coef_raw = str(d.get("Коэффициент", "1")).replace(",", ".").strip() or "1"
+        try:
+            coef = float(coef_raw)
+        except Exception:
+            coef = 1.0
+
+        coef_by_plate[plate] = coef
+        name_by_plate[plate] = (
+            str(d.get("ФИО", "")).strip()
+            or str(d.get("Имя", "")).strip()
+            or plate
+        )
+
+    from collections import defaultdict
+
+    summary = defaultdict(lambda: {"sum": 0.0, "count": 0, "coef": 1.0})
+
+    # ——————————————————————————————
+    # Перебираем заявки
+    # ——————————————————————————————
+    for row in orders:
         status = str(row.get("Статус", "")).strip().lower()
         if status != "выполнено":
             continue
-        dt = try_parse_datetime(row.get("Факт Дата и время")) or try_parse_datetime(row.get("Время обновления"))
-        if not dt or dt.date() != now.date():
+
+        fact_dt = row.get("Факт Дата и время") or row.get("Время обновления")
+        dt = try_parse_datetime(fact_dt)
+        if not dt or dt.date() != today:
             continue
-        price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".") or 0)
-        coef = coef_by_id.get(driver_id, 1.0)
-        summary[driver_id]["sum"] += price
-        summary[driver_id]["coef"] = coef
-        summary[driver_id]["count"] += 1
+
+        plate = str(row.get("Гос номер", "")).strip()
+        if not plate:
+            continue
+
+        price_raw = str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", ".").strip() or "0"
+        try:
+            price = float(price_raw)
+        except Exception:
+            price = 0.0
+
+        coef = coef_by_plate.get(plate, 1.0)
+
+        bucket = summary[plate]
+        bucket["sum"] += price
+        bucket["count"] += 1
+        bucket["coef"] = coef
+
+    message = update.message or update.callback_query.message
 
     if not summary:
-        await update.message.reply_text("📊 За сегодня выполненных заявок нет.")
+        await message.reply_text("📊 За сегодня выполненных заявок нет.")
         return
 
+    # ——————————————————————————————
+    # Формируем итоговое сообщение
+    # ——————————————————————————————
     lines = []
     total_all = 0.0
-    for drv_id, data in summary.items():
+
+    for plate, data in summary.items():
         total_with_coef = data["sum"] * data["coef"]
         total_all += total_with_coef
+
+        name = name_by_plate.get(plate, plate)
+
         lines.append(
-            f"🚚 ID {drv_id}: {data['count']} заявок, {data['sum']:.2f} ₽ × {data['coef']} = {total_with_coef:.2f} ₽"
+            f"🚚 {name} ({plate}): {data['count']} заявок, "
+            f"{data['sum']:.2f} ₽ × {data['coef']} = {total_with_coef:.2f} ₽"
         )
 
-    msg = "📊 Итоги дня:\n" + "\n".join(lines) + f"\n\nИтого по всем: {total_all:.2f} ₽"
-    await update.message.reply_text(msg)
+    msg = (
+        "📊 Итоги дня по водителям:\n\n"
+        + "\n".join(lines)
+        + f"\n\nИтого по всем: {total_all:.2f} ₽"
+    )
+
+    await message.reply_text(msg)
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
 async def optimize_and_assign(bot, context=None):
@@ -2085,6 +2131,10 @@ if __name__ == "__main__":
         pattern=r"^confirm_assign_driver:"
     ))
 
+    # === Итоги дня (callback-кнопка) ===
+    app.add_handler(CallbackQueryHandler(daily_summary, pattern=r"^summary$"))
+
+
     # === Общие кнопки ===
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CallbackQueryHandler(earnings, pattern="^earnings$"))
@@ -2097,3 +2147,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
+
