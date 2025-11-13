@@ -2105,14 +2105,19 @@ if __name__ == "__main__":
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
         raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+
     app = ApplicationBuilder().token(TOKEN).build()
 
-       # Команды
+    # ============================
+    #       КОМАНДЫ
+    # ============================
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("earnings", earnings))
-    app.add_handler(CommandHandler("summary", daily_summary))
+    app.add_handler(CommandHandler("earnings", earnings))   # оставить — водителю нужно
+    app.add_handler(CommandHandler("summary", daily_summary))  # админская команда
 
-    # === Хендлеры редактирования маршрутов ===
+    # ============================
+    #   CALLBACK: РЕДАКТИРОВАНИЕ
+    # ============================
     app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
     app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
@@ -2121,30 +2126,50 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(edit_transfer_route, pattern=r"^edit_transfer:"))
     app.add_handler(CallbackQueryHandler(edit_transfer_confirm, pattern=r"^edit_transfer_confirm:"))
 
-    # === Выбор и назначение водителя (должно идти ДО button_handler) ===
+    # ============================================================
+    #    CALLBACK: ВЫБОР И НАЗНАЧЕНИЕ ВОДИТЕЛЯ
+    #    (ВСЕГДА СТАВИТЬ ПЕРЕД ОБЩИМ button_handler)
+    # ============================================================
     app.add_handler(CallbackQueryHandler(
         lambda u, c: choose_driver(u, c, u.callback_query.data.split(':')[1]),
         pattern=r"^choose_driver:"
     ))
+
     app.add_handler(CallbackQueryHandler(
         lambda u, c: confirm_assign_driver(u, c, *u.callback_query.data.split(':')[1:]),
         pattern=r"^confirm_assign_driver:"
     ))
 
-    # === Итоги дня (callback-кнопка) ===
+    # ============================
+    #   CALLBACK: ИТОГИ ДНЯ
+    # ============================
     app.add_handler(CallbackQueryHandler(daily_summary, pattern=r"^summary$"))
 
-
-    # === Общие кнопки ===
+    # ============================
+    #   ОБЩИЙ CALLBACK-ХЕНДЛЕР
+    # ============================
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CallbackQueryHandler(earnings, pattern="^earnings$"))
 
-    # === Файлы Excel ===
+    # ============================
+    #     CALLBACK earnings
+    # ============================
+    # ОСТАВЛЯЕМ — МОЖЕТ БЫТЬ КНОПКА ДЛЯ ВОДИТЕЛЯ, НО НЕ ДЛЯ АДМИНА
+    app.add_handler(CallbackQueryHandler(earnings, pattern=r"^earnings$"))
+
+    # ============================
+    #        ФАЙЛЫ EXCEL
+    # ============================
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
-    # === Меню админа и водителей ===
+    # ====================================================
+    #        MESSAGE: ТЕКСТЫ ОТ АДМИНА
+    # ====================================================
+    # СТАВИМ ВЫШЕ ВСЕХ message-текстов, иначе НЕ СРАБОТАЕТ
     app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), handle_admin_menu))
+
+    # ====================================================
+    #        MESSAGE: ТЕКСТЫ ОТ ВОДИТЕЛЕЙ
+    # ====================================================
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
