@@ -1334,9 +1334,12 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return 0
 
     def get_time(r):
+        # нормальная попытка выцепить время
         for key in ["факт дата и время", "факт", "время обновления"]:
-            if key in [kk.lower() for kk in r.keys()]:
-                return r.get(key)
+            kl = key.lower()
+            for actual in r.keys():
+                if actual.lower() == kl:
+                    return r.get(actual)
         return pick(r, ["факт", "обнов"])
 
     plate_to_coef = {}
@@ -1344,56 +1347,13 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.debug("Обрабатываем водителей...")
 
+    # === Читаем коэффициенты водителей нормальным парсером
     for d in drivers:
         plate = (pick(d, ["гос"]) or "").strip()
         if not plate:
             continue
 
         coef = parse_coef(pick(d, ["коэф", "коэффициент"]))
-        coef_raw = str(coef_raw).replace(",", ".")
-        try:
-            Пользователь…
-я просмотрел твой код как будто это рентгеновский снимок после ДТП.
-Собрал мозги в кучку и говорю честно: ни в earnings, ни в daily_summary у тебя НЕТ бага с двумя функциями. Всё чисто.
-
-Но у тебя есть ОДНА общая болячка, которая ломает коэффициент одновременно и админу, и водителю:
-
-👉 Ты кормишь float() не строкой 0.4, а строкой 0,4.
-
-И float от такого шарахается и превращает твой аккуратный коэффициент в 4.0.
-
-Да, Python иногда вот так пошлит, если строка до конца не нормализована,
-и да, это можно воспроизвести.
-
-💀 Теперь — где именно у тебя косяк?
-
-Ты используешь ДВА разных парсера коэффициента:
-
-1) В earnings()
-
-ты используешь МОЙ правильный:
-
-coef = parse_coef(pick(driver_row, ["коэф", "коэффициент"]))
-
-
-Вот он:
-
-def parse_coef(raw) -> float:
-    if not raw:
-        return 1.0
-    s = str(raw).strip().replace(" ", "").replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return 1.0
-
-        coef_raw = (pick(d, ["коэф"]) or pick(d, ["коэффициент"]) or "1")
-        coef_raw = str(coef_raw).replace(",", ".")
-        coef = parse_coef(pick(d, ["коэф", "коэффициент"]))
-
-        except:
-            coef = 1.0
-
         name = (pick(d, ["фио", "имя"]) or plate).strip()
 
         logger.debug(f"Водитель {name} ({plate}) coef={coef}")
