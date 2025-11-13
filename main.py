@@ -160,30 +160,43 @@ def to_unix(dt: datetime) -> int:
     return int(dt.timestamp())
 
 def try_parse_datetime(val):
+    """Адекватный парсер дат, со встроенным логированием."""
     if not val:
+        logger.debug("try_parse_datetime: пустое значение")
         return None
+
     if isinstance(val, datetime):
+        logger.debug(f"try_parse_datetime: уже datetime {val}")
         return val
+
     if isinstance(val, date):
-        return datetime.combine(val, datetime.min.time())
+        dt = datetime.combine(val, datetime.min.time())
+        logger.debug(f"try_parse_datetime: date -> {dt}")
+        return dt
 
     text = str(val).strip()
+    logger.debug(f"try_parse_datetime: парсим текст '{text}'")
 
     fmts = [
         "%d.%m.%Y %H:%M",
         "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S.%f",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
         "%d.%m.%Y",
         "%Y-%m-%d",
     ]
 
     for fmt in fmts:
         try:
-            return datetime.strptime(text, fmt)
+            dt = datetime.strptime(text, fmt)
+            logger.debug(f"try_parse_datetime: формат '{fmt}' подошёл -> {dt}")
+            return dt
         except:
             pass
 
+    logger.warning(f"try_parse_datetime: не смог распознать дату '{text}'")
     return None
 
 def parse_time_window(cell_value: str, pad_minutes: int = TIME_WINDOW_PADDING_MIN):
@@ -746,23 +759,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text(f"⚠️ Ошибка при обработке: {type(e).__name__}: {e}")
 
-
-# === Универсальный парсер даты ===
-def try_parse_datetime(val):
-    """Пробует распарсить дату в любом нормальном виде."""
-    if not val:
-        return None
-    if isinstance(val, datetime):
-        return val
-    if isinstance(val, date):
-        return datetime.combine(val, datetime.min.time())
-
-    text = str(val).strip()
-    for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(text, fmt)
-        except Exception:
-            pass
     return None
 
 # === ORS / РАСПРЕДЕЛЕНИЕ ===
@@ -1102,7 +1098,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Меню для водителя (только заработок)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
-    ])
+        ])
     await update.message.reply_text(
         "Укажи параметры машины, например:\n"
         "`2.5, 500, А123ВС78`\n"
@@ -1269,8 +1265,8 @@ def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     return InlineKeyboardMarkup(rows)
 
 async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Итоги дня по водителям (стабильная версия)."""
     message = update.message or update.callback_query.message
+    logger.debug("=== DAILY SUMMARY START ===")
 
     try:
         ws_orders = client.open(SHEET_NAME).sheet1
@@ -1279,13 +1275,16 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orders = ws_orders.get_all_records()
         drivers = ws_drivers.get_all_records()
 
+        logger.debug(f"orders rows: {len(orders)}, drivers: {len(drivers)}")
     except Exception as e:
-        await message.reply_text(f"⚠️ Не удалось прочитать таблицы: {e}")
+        msg = f"⚠️ Не удалось прочитать таблицы: {e}"
+        logger.error(msg)
+        await message.reply_text(msg)
         return
 
     today = datetime.now().date()
+    logger.debug(f"Сегодня: {today}")
 
-    # === Универсальный поиск колонок ===
     def pick(row, keys):
         for k, v in row.items():
             kl = k.lower()
@@ -1293,21 +1292,34 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return v
         return None
 
-    # функции-извлекатели
     def get_status(r): return (pick(r, ["статус"]) or "").strip().lower()
     def get_plate(r): return (pick(r, ["гос"]) or "").strip()
-    def get_price(r): return pick(r, ["стоимость"]) or "0"
-    def get_time(r):  return pick(r, ["факт", "обнов"]) or ""
 
-    # водители
+    def get_price(r):
+        for key in ["стоимость доставки (для расчёта)", "стоимость", "стоимость доставки"]:
+            v = r.get(key)
+            if v not in (None, "", " "):
+                return v
+        return 0
+
+    def get_time(r):
+        for key in ["факт дата и время", "факт", "время обновления"]:
+            if key in [kk.lower() for kk in r.keys()]:
+                return r.get(key)
+        return pick(r, ["факт", "обнов"])
+
     plate_to_coef = {}
     plate_to_name = {}
+
+    logger.debug("Обрабатываем водителей...")
 
     for d in drivers:
         plate = (pick(d, ["гос"]) or "").strip()
         if not plate:
             continue
-        coef_raw = (pick(d, ["коэф"]) or "1").replace(",", ".")
+
+        coef_raw = (pick(d, ["коэф"]) or pick(d, ["коэффициент"]) or "1")
+        coef_raw = str(coef_raw).replace(",", ".")
         try:
             coef = float(coef_raw)
         except:
@@ -1315,24 +1327,31 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         name = (pick(d, ["фио", "имя"]) or plate).strip()
 
+        logger.debug(f"Водитель {name} ({plate}) coef={coef}")
+
         plate_to_coef[plate] = coef
         plate_to_name[plate] = name
 
-    # === Считаем ===
-    from collections import defaultdict
     summary = defaultdict(lambda: {"cnt": 0, "sum": 0.0, "coef": 1.0})
 
+    logger.debug("Обрабатываем заявки...")
+
     for row in orders:
-        if get_status(row) != "выполнено":
+        status = get_status(row)
+        if status != "выполнено":
             continue
 
         dt_raw = get_time(row)
         dt = try_parse_datetime(dt_raw)
+
+        logger.debug(f"Заявка dt_raw='{dt_raw}' -> dt={dt}")
+
         if not dt or dt.date() != today:
             continue
 
         plate = get_plate(row)
         if not plate:
+            logger.debug("Строка выполнена, но без госномера — пропуск")
             continue
 
         try:
@@ -1347,8 +1366,10 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bucket["sum"] += price
         bucket["coef"] = coef
 
-    # === Вывод ===
+        logger.debug(f"[{plate}] +1 заявка, price={price}, coef={coef}")
+
     if not summary:
+        logger.debug("Итоги пустые — ничего не выполнено")
         await message.reply_text("📊 За сегодня выполненных заявок нет.")
         return
 
@@ -1366,11 +1387,12 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     text = (
-        "📊 Итоги дня:\n\n" +
-        "\n".join(lines) +
-        f"\n\nИтого по всем: {total_all:.2f} ₽"
+        "📊 Итоги дня:\n\n"
+        + "\n".join(lines)
+        + f"\n\nИтого по всем: {total_all:.2f} ₽"
     )
 
+    logger.debug("=== DAILY SUMMARY END ===")
     await message.reply_text(text)
 
 # === ОСНОВНАЯ ОПТИМИЗАЦИЯ ===
