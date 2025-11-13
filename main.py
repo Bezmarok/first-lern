@@ -1175,84 +1175,100 @@ async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка регистрации водителя: {e}")
         await update.message.reply_text("⚠️ Неверный формат. Пример: `2.5, 500, А123ВС78`", parse_mode="Markdown")
 
-async def earnings(update, context):
+async def earnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Показывает водителю сумму его заработка за последние 24 часа
+    Показывает водителю его заработок за последние 24 часа
     (по заявкам со статусом 'выполнено') с учётом коэффициента.
     """
+
+    message = update.message or update.callback_query.message
+
     try:
-        # Соединение с Google Sheets
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-
-        client = gspread.authorize(creds)
-
+        # Google Sheets
         ws_orders = client.open("Cargodeliver").worksheet("Лист1")
         ws_drivers = client.open("Cargodeliver").worksheet("Водители")
 
-        data = ws_orders.get_all_records()
+        orders = ws_orders.get_all_records()
         drivers = ws_drivers.get_all_records()
 
-        # Определяем Telegram ID водителя
-        user_id = str(update.effective_user.id)
-
-        # Находим коэффициент водителя
-        driver_row = next(
-            (r for r in drivers
-             if str(r.get("Telegram ID") or r.get("telegram id") or "").strip() == user_id),
-            None
-        )
-        coef = float(str(driver_row.get("Коэффициент", "1")).replace(",", ".") or 1) if driver_row else 1
-
-        # Временной фильтр (последние 24 часа)
-        now = datetime.now(timezone(timedelta(hours=3)))  # МСК
-        cutoff = now - timedelta(hours=24)
-
-        total = 0
-        completed_rows = []
-        for row in data:
-            status = str(row.get("Статус", "")).strip().lower()
-            driver_name = str(row.get("Водитель", "")).strip()
-            fact_time = str(row.get("Факт Дата и время", "")).strip()
-
-            if status == "выполнено" and fact_time and driver_name:
-                try:
-                    dt = datetime.strptime(fact_time, "%d.%m.%Y %H:%M")
-                    dt = dt.replace(tzinfo=timezone(timedelta(hours=3)))
-                except Exception:
-                    continue
-
-                if dt >= cutoff and str(driver_row.get("Водитель", "")) in driver_name:
-                    try:
-                        price = float(str(row.get("Стоимость доставки (для расчёта)", "0")).replace(",", "."))
-                    except Exception:
-                        price = 0.0
-                    total += price
-                    completed_rows.append(row)
-
-        # Подсчёт заработка
-        earnings_sum = round(total * coef, 2)
-
-        # Формирование сообщения
-        if not completed_rows:
-            msg = "💰 За последние 24 часа выполненных заявок нет."
-        else:
-            msg = (
-                f"💰 *Ваш заработок за сутки:*\n"
-                f"— Выполнено заявок: {len(completed_rows)}\n"
-                f"— Коэффициент: {coef}\n"
-                f"— Начислено: *{earnings_sum} ₽*"
-            )
-
-        # Отправка водителю
-        message = update.message or update.callback_query.message
-        await message.reply_text(msg, parse_mode="Markdown")
-
     except Exception as e:
-        message = update.message or update.callback_query.message
-        await message.reply_text(f"⚠️ Ошибка при расчёте заработка: {e}")
+        await message.reply_text(f"Ошибка чтения таблиц: {e}")
+        return
+
+    # Telegram ID водителя
+    user_id = str(update.effective_user.id).strip()
+
+    # Ищем водителя
+    driver_plate = None
+    coef = 1.0
+
+    for d in drivers:
+        tid = str(d.get("telegram id") or "").strip()
+
+        if tid == user_id:
+            driver_plate = str(d.get("Гос номер") or "").strip()
+
+            coef_raw = str(d.get("Коэффициент") or "1").replace(",", ".")
+            try:
+                coef = float(coef_raw)
+            except:
+                coef = 1.0
+
+            break
+
+    if not driver_plate:
+        await message.reply_text("Не удалось определить ваш госномер в таблице 'Водители'.")
+        return
+
+    # Последние 24 часа
+    cutoff = datetime.now() - timedelta(hours=24)
+
+    total = 0
+    completed_rows = []
+
+    for row in orders:
+
+        status = str(row.get("Статус", "")).strip().lower()
+        plate = str(row.get("Гос номер", "")).strip()
+        fact_time_raw = row.get("Факт Дата и время")
+
+        if status != "выполнено":
+            continue
+        if plate != driver_plate:
+            continue
+
+        # Парсим дату и время через новую try_parse_datetime
+        dt = try_parse_datetime(fact_time_raw)
+        if not dt:
+            continue
+
+        if dt < cutoff:
+            continue
+
+        # Цена
+        try:
+            price = float(str(row.get("Стоимость доставки") or "0").replace(",", "."))
+        except:
+            price = 0.0
+
+        total += price
+        completed_rows.append(row)
+
+    # Сумма с коэффициентом
+    final_amount = total * coef
+
+    if not completed_rows:
+        await message.reply_text("💸 За последние 24 часа выполненных заявок нет.")
+        return
+
+    text = (
+        f"💰 За последние 24 часа выполнено заявок: {len(completed_rows)}\n"
+        f"Сумма без коэффициента: {total:.2f} ₽\n"
+        f"Коэффициент: {coef}\n"
+        f"Итого: {final_amount:.2f} ₽"
+    )
+
+    await message.reply_text(text)
 
 def build_task_keyboard(lat: float | None, lon: float | None, row_index: int):
     rows = [[
