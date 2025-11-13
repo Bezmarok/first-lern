@@ -1105,30 +1105,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на постоянное меню для администратора."""
-    if update.effective_user.id != ADMIN_ID:
+    """Обработка текстовых сообщений от администратора."""
+
+    user = update.effective_user
+    if user.id != ADMIN_ID:
         return
 
-    text = (update.message.text or "").strip().lower()
+    text_raw = update.message.text or ""
+    text = text_raw.lower().replace(" ", "")
 
+    # === ИТОГИ ДНЯ ===
+    # Ловим любые варианты: "итоги дня", "итог", "📊 Итоги дня", кнопка меню и т.д.
+    if ("итог" in text) or ("summary" in text) or ("📊" in text_raw):
+        print(">>> DAILY SUMMARY TRIGGERED <<<")
+        await daily_summary(update, context)
+        return
+
+    # === ОПТИМИЗАЦИЯ ===
     if "оптимизац" in text:
         ok = await optimize_and_assign(context.bot, context)
         if ok:
             await update.message.reply_text("🚀 Оптимизация выполнена. Результаты отправлены.")
         else:
-            await update.message.reply_text("⚠️ Оптимизация не выполнена. См. сообщение(я) выше.")
+            await update.message.reply_text("⚠️ Оптимизация не выполнена. Проверьте сообщения выше.")
         return
 
-    elif "итог" in text:
-        # ВАЖНО: вызываем правильную функцию, не earnings()
-        await daily_summary(update, context)
+    # === ЗАГРУЗКА EXCEL ===
+    if "excel" in text or "загруз" in text or "файл" in text:
+        await update.message.reply_text("📂 Пришлите Excel файл (.xlsx или .xls).")
         return
 
-    elif "excel" in text or "загруз" in text:
-        await update.message.reply_text("📂 Пришлите Excel-файл (.xlsx или .xls).")
-        return
-
-    await update.message.reply_text("Команда из меню не распознана. Тыкните кнопку ниже ещё раз.")
+    # === НЕИЗВЕСТНАЯ КОМАНДА ===
+    await update.message.reply_text("Не понял. Используйте кнопки под полем ввода.")
 
 async def handle_driver_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
