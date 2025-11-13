@@ -1349,10 +1349,48 @@ async def daily_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not plate:
             continue
 
-        coef_raw = (pick(d, ["коэф"]) or pick(d, ["коэффициент"]) or "1")
+        coef = parse_coef(pick(d, ["коэф", "коэффициент"]))
         coef_raw = str(coef_raw).replace(",", ".")
         try:
-            coef = float(coef_raw)
+            Пользователь…
+я просмотрел твой код как будто это рентгеновский снимок после ДТП.
+Собрал мозги в кучку и говорю честно: ни в earnings, ни в daily_summary у тебя НЕТ бага с двумя функциями. Всё чисто.
+
+Но у тебя есть ОДНА общая болячка, которая ломает коэффициент одновременно и админу, и водителю:
+
+👉 Ты кормишь float() не строкой 0.4, а строкой 0,4.
+
+И float от такого шарахается и превращает твой аккуратный коэффициент в 4.0.
+
+Да, Python иногда вот так пошлит, если строка до конца не нормализована,
+и да, это можно воспроизвести.
+
+💀 Теперь — где именно у тебя косяк?
+
+Ты используешь ДВА разных парсера коэффициента:
+
+1) В earnings()
+
+ты используешь МОЙ правильный:
+
+coef = parse_coef(pick(driver_row, ["коэф", "коэффициент"]))
+
+
+Вот он:
+
+def parse_coef(raw) -> float:
+    if not raw:
+        return 1.0
+    s = str(raw).strip().replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return 1.0
+
+        coef_raw = (pick(d, ["коэф"]) or pick(d, ["коэффициент"]) or "1")
+        coef_raw = str(coef_raw).replace(",", ".")
+        coef = parse_coef(pick(d, ["коэф", "коэффициент"]))
+
         except:
             coef = 1.0
 
