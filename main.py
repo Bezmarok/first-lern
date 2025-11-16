@@ -6,6 +6,7 @@ import os
 import json
 import re
 import tempfile
+from requests.exceptions import HTTPError
 from datetime import datetime, timedelta, date, timezone
 import pytz
 from collections import defaultdict
@@ -235,70 +236,143 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 # === Глобальный кэш геокодинга ===
 addr_cache = {}
 
+# === Глобальный кэш геокодинга ===
+addr_cache = {}
+
+def generate_addr_candidates(addr: str) -> list[str]:
+    """
+    Строит цепочку всё более грубых адресов.
+    Варианты идут от самого точного к более общим.
+    """
+    if not addr:
+        return []
+
+    s = re.sub(r"\s{2,}", " ", addr).strip(",; ").strip()
+    variants = []
+
+    def _add(v):
+        v = re.sub(r"\s{2,}", " ", v).strip(",; ").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    # 0) исходный
+    _add(s)
+
+    # 1) убираем квартиру/офис/помещение/литеру/строение/корпус
+    s1 = re.sub(
+        r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)|(корп\.?\s*\S+)",
+        "",
+        s,
+        flags=re.IGNORECASE
+    )
+    _add(s1)
+
+    # 2) обрезаем «д. 51 к3а» → «д. 51»
+    s2 = re.sub(r"(д\.?\s*\d+)[^,\d]*", r"\1", s1, flags=re.IGNORECASE)
+    _add(s2)
+
+    # 3) режем по запятым с хвоста: убираем самые мелкие части
+    parts = [p.strip() for p in s2.split(",") if p.strip()]
+    for cut in range(1, min(4, len(parts))):
+        _add(", ".join(parts[:-cut]))
+
+    # 4) просто «улица ...»
+    m = re.search(r"(ул\.?|улица)\s+[^,]+", s2, re.IGNORECASE)
+    if m:
+        _add(m.group(0))
+
+    return variants
+
+
+def _ors_geocode_single(query: str):
+    """
+    Один запрос к ORS geocode, возвращает (lon, lat) или None.
+    """
+    url = "https://api.openrouteservice.org/geocode/search"
+    params = {
+        "api_key": ORS_API_KEY,
+        "text": query,
+        "size": 5,
+        "lang": "ru",
+        "boundary.country": "RU",
+        "focus.point.lon": WAREHOUSE_LON,
+        "focus.point.lat": WAREHOUSE_LAT,
+    }
+    r = requests.get(url, params=params, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    feats = data.get("features", [])
+    if not feats:
+        return None
+
+    wh_lat = float(WAREHOUSE_LAT)
+    wh_lon = float(WAREHOUSE_LON)
+    best = None
+    best_dist = float("inf")
+    for f in feats:
+        lon, lat = f["geometry"]["coordinates"]
+        dist = _haversine_km(wh_lat, wh_lon, float(lat), float(lon))
+        if dist < best_dist:
+            best_dist = dist
+            best = (float(lon), float(lat))
+    return best
+
 def geocode_address(address: str):
     """
-    Безопасный геокодер ORS с кэшированием и fallback.
+    Многошаговый геокодер ORS:
+      1) чистит адрес
+      2) генерит несколько вариантов от точного к общим
+      3) пробует до первого успешного результата
+      4) при полном провале — координаты склада
     Всегда возвращает (lon, lat).
     """
 
     if not address:
         logger.error(f"[GEOCODE] Пустой адрес")
-        return WAREHOUSE_LON, WAREHOUSE_LAT   # fallback
+        return float(WAREHOUSE_LON), float(WAREHOUSE_LAT)
 
-    # чистим индекс и странные вещи
+    # базовая чистка
     addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
-    addr = addr.replace("Северо-Западный федеральный округ", "").strip()
+    addr = addr.replace("Северо-Западный федеральный округ", "")
+    addr = addr.replace("Северо-Западный округ", "")
+    addr = re.sub(r"\s{2,}", " ", addr).strip(",; ").strip()
 
-    # проверка кэша
+    # кэш по уже очищенному адресу
     if addr in addr_cache:
         return addr_cache[addr]
 
-    try:
-        url = "https://api.openrouteservice.org/geocode/search"
-        params = {
-            "api_key": ORS_API_KEY,
-            "text": addr,
-            "size": 5,
-            "lang": "ru",
-            "boundary.country": "RU",
-            "focus.point.lon": WAREHOUSE_LON,
-            "focus.point.lat": WAREHOUSE_LAT
-        }
+    candidates = generate_addr_candidates(addr)
+    last_error = None
 
-        r = requests.get(url, params=params, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        feats = data.get("features", [])
+    for cand in candidates:
+        try:
+            logger.debug(f"[GEOCODE] Пробую вариант: '{cand}'")
+            res = _ors_geocode_single(cand)
+            if res is None:
+                # ORS ответил 200, но ничего не нашёл — идём дальше, к более общему адресу
+                continue
+            addr_cache[addr] = res
+            return res
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            # на 5xx просто пробуем следующий вариант адреса
+            if status and 500 <= status < 600:
+                logger.warning(f"[GEOCODE] ORS 5xx на адрес '{cand}': {status}")
+                last_error = e
+                continue
+            # 4xx или что-то другое — дальше дергать смысла мало
+            last_error = e
+            logger.error(f"[GEOCODE] HTTP {status} для '{cand}', прекращаю попытки")
+            break
+        except Exception as e:
+            last_error = e
+            logger.error(f"[GEOCODE] Ошибка для '{cand}': {e}")
+            continue
 
-        if not feats:
-            logger.warning(f"[GEOCODE] ORS не нашёл адрес: '{addr}'")
-            # fallback: точка склада
-            fallback = (float(WAREHOUSE_LON), float(WAREHOUSE_LAT))
-            addr_cache[addr] = fallback
-            return fallback
-
-        # выбираем ближайший результат
-        wh_lat = float(WAREHOUSE_LAT)
-        wh_lon = float(WAREHOUSE_LON)
-        best = None
-        best_dist = float("inf")
-
-        for f in feats:
-            lon, lat = f["geometry"]["coordinates"]
-            dist = _haversine_km(wh_lat, wh_lon, float(lat), float(lon))
-            if dist < best_dist:
-                best_dist = dist
-                best = (float(lon), float(lat))
-
-        addr_cache[addr] = best
-        return best
-
-    except Exception as e:
-        logger.error(f"[GEOCODE] Ошибка ORS при геокодировании '{address}': {e}")
-        # fallback на склад, чтобы не ронять оптимизацию
-        fallback = (float(WAREHOUSE_LON), float(WAREHOUSE_LAT))
-        addr_cache[addr] = fallback
-        return fallback
+    logger.error(f"[GEOCODE] Не удалось геокодировать '{addr}' ни одним из вариантов. Последняя ошибка: {last_error}")
+    fallback = (float(WAREHOUSE_LON), float(WAREHOUSE_LAT))
+    addr_cache[addr] = fallback
+    return fallback
 
 def build_point_route_url(lat: float | None, lon: float | None) -> str:
     if lat is None or lon is None:
@@ -367,6 +441,98 @@ def safe_col(df, name):
         logger.warning(f"Колонка '{name}' дублируется, беру первую")
         col = col.iloc[:, 0]
     return col
+
+def _call_ors_raw(payload: dict) -> dict:
+    """
+    Голый вызов ORS optimization с логированием тела ошибки.
+    payload уже должен содержать jobs/vehicles/options.
+    """
+    url = "https://api.openrouteservice.org/optimization"
+    headers = {"Authorization": ORS_API_KEY}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+
+    if r.status_code >= 400:
+        txt = r.text[:1000]
+        logger.error(f"ORS error {r.status_code}: {txt}")
+        r.raise_for_status()
+
+    return r.json()
+
+def find_bad_jobs(jobs: list[dict], vehicles: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Возвращает (good_jobs, bad_jobs).
+    bad_jobs — минимальный набор заявок, на которых ORS стабильно падает с 5xx.
+    """
+    good, bad = [], []
+
+    def check_subset(sub):
+        payload = {"jobs": sub, "vehicles": vehicles, "options": {"g": True}}
+        payload = prepare_payload_for_ors(payload)
+        return _call_ors_raw(payload)
+
+    def dfs(sub):
+        nonlocal good, bad
+        if not sub:
+            return
+        try:
+            check_subset(sub)
+            # если всё посчиталось — это хороший кусок
+            good.extend(sub)
+        except HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code and 500 <= code < 600:
+                # серверная ошибка — режем дальше
+                if len(sub) == 1:
+                    bad.extend(sub)
+                else:
+                    mid = len(sub) // 2
+                    dfs(sub[:mid])
+                    dfs(sub[mid:])
+            else:
+                # не 5xx — это уже логический косяк, пусть летит наверх
+                raise
+
+    dfs(jobs)
+    return good, bad
+
+def ors_optimize_safe(jobs, vehicles):
+    """
+    Комбо-вариант:
+      1) пытаемся обычную оптимизацию
+      2) если ORS даёт 5xx — бинарно ищем плохие jobs,
+         выкидываем их и считаем по остальным.
+    Возвращает (solution, bad_jobs_list).
+    """
+    payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
+    payload = prepare_payload_for_ors(payload)
+
+    try:
+        logger.info(f"ORS try: jobs={len(jobs)}, vehicles={len(vehicles)}")
+        sol = _call_ors_raw(payload)
+        return sol, []
+    except HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        if not (code and 500 <= code < 600):
+            # не внутренняя ошибка ORS — пробрасываем
+            raise
+
+        logger.warning(f"ORS 5xx на {len(jobs)} заявках. Начинаю поиск проблемных jobs...")
+        good_jobs, bad_jobs = find_bad_jobs(jobs, vehicles)
+
+        if not good_jobs:
+            # вообще ад: ORS падает даже на одной заявке
+            raise RuntimeError("ORS падает даже на минимальном наборе заявок")
+
+        logger.warning(
+            f"Плохих заявок: {len(bad_jobs)}; хороших: {len(good_jobs)}. "
+            f"Оптимизирую только по хорошим."
+        )
+
+        payload2 = {"jobs": good_jobs, "vehicles": vehicles, "options": {"g": True}}
+        payload2 = prepare_payload_for_ors(payload2)
+        sol2 = _call_ors_raw(payload2)
+        return sol2, bad_jobs
 
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     ext = os.path.splitext(filename.lower())[1]
@@ -1460,10 +1626,25 @@ async def optimize_and_assign(bot, context=None):
         return False
 
     try:
-        solution = ors_optimize(jobs, vehicles)
+        solution, bad_jobs = ors_optimize_safe(jobs, vehicles)
     except Exception as e:
         await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Ошибка оптимизации: {e}")
         return False
+
+    # если были выкинутые заявки — предупреждаем админа
+    if bad_jobs:
+        bad_ids = [j["id"] for j in bad_jobs]
+        lines = []
+        for j in bad_jobs:
+            jid = j["id"]
+            info = job_info.get(jid, {})
+            lines.append(f"• №{info.get('order_no', jid)} — {info.get('addr', '')}")
+        msg = (
+            "⚠️ Часть заявок исключена из оптимизации, т.к. ORS из-за них падает:\n\n"
+            + "\n".join(lines)
+            + "\n\nОни останутся в таблице без маршрута, проверь руками."
+        )
+        await bot.send_message(chat_id=ADMIN_ID, text=msg)
 
     routes = solution.get("routes", [])
     unassigned_raw = solution.get("unassigned", [])
