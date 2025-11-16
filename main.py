@@ -237,18 +237,20 @@ addr_cache = {}
 
 def geocode_address(address: str):
     """
-    Геокодирование адреса через OpenRouteService с кэшированием.
-    ВОЗВРАЩАЕТ (lon, lat) — строго в этом порядке, как требует ORS.
+    Безопасный геокодер ORS с кэшированием и fallback.
+    Всегда возвращает (lon, lat).
     """
+
     if not address:
-        return (None, None)
+        logger.error(f"[GEOCODE] Пустой адрес")
+        return WAREHOUSE_LON, WAREHOUSE_LAT   # fallback
 
-    # чистим индекс и пробелы
+    # чистим индекс и странные вещи
     addr = re.sub(r"^\d{5,6},?\s*", "", address.strip())
+    addr = addr.replace("Северо-Западный федеральный округ", "").strip()
 
-    # проверяем в кэше (ключ — очищенный адрес, значение — (lon, lat))
+    # проверка кэша
     if addr in addr_cache:
-        logger.debug(f"[CACHE] Геокод найден для '{addr}' -> {addr_cache[addr]}")
         return addr_cache[addr]
 
     try:
@@ -262,36 +264,41 @@ def geocode_address(address: str):
             "focus.point.lon": WAREHOUSE_LON,
             "focus.point.lat": WAREHOUSE_LAT
         }
+
         r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         data = r.json()
         feats = data.get("features", [])
-        if not feats:
-            logger.warning(f"Геокодинг: нет результатов для '{addr}'")
-            return (None, None)
 
-        # выбираем ближайший к складу результат
-        best = None
-        best_dist = float("inf")
+        if not feats:
+            logger.warning(f"[GEOCODE] ORS не нашёл адрес: '{addr}'")
+            # fallback: точка склада
+            fallback = (float(WAREHOUSE_LON), float(WAREHOUSE_LAT))
+            addr_cache[addr] = fallback
+            return fallback
+
+        # выбираем ближайший результат
         wh_lat = float(WAREHOUSE_LAT)
         wh_lon = float(WAREHOUSE_LON)
+        best = None
+        best_dist = float("inf")
+
         for f in feats:
             lon, lat = f["geometry"]["coordinates"]
             dist = _haversine_km(wh_lat, wh_lon, float(lat), float(lon))
             if dist < best_dist:
                 best_dist = dist
-                best = (float(lon), float(lat))  # строго (lon, lat)
+                best = (float(lon), float(lat))
 
-        if best:
-            addr_cache[addr] = best
-            logger.debug(f"[GEOCODE] '{addr}' -> {best} (добавлено в кэш)")
-            return best
-
-        return (None, None)
+        addr_cache[addr] = best
+        return best
 
     except Exception as e:
-        logger.error(f"Ошибка ORS при геокодировании '{address}': {e}")
-        return (None, None)
+        logger.error(f"[GEOCODE] Ошибка ORS при геокодировании '{address}': {e}")
+        # fallback на склад, чтобы не ронять оптимизацию
+        fallback = (float(WAREHOUSE_LON), float(WAREHOUSE_LAT))
+        addr_cache[addr] = fallback
+        return fallback
 
 def build_point_route_url(lat: float | None, lon: float | None) -> str:
     if lat is None or lon is None:
@@ -2239,4 +2246,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
