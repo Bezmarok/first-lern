@@ -7,6 +7,7 @@ import json
 import re
 import tempfile
 from requests.exceptions import HTTPError
+import time
 from datetime import datetime, timedelta, date, timezone
 import pytz
 from collections import defaultdict
@@ -88,13 +89,17 @@ ORS_API_KEY = os.environ.get("ORS_API_KEY")
 if not ORS_API_KEY:
     raise RuntimeError("Не задана переменная окружения ORS_API_KEY")
 
-ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
+ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "260653949"))
 
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
 
 TIME_WINDOW_PADDING_MIN = int(os.environ.get("TW_PADDING_MIN", "45"))
 DEFAULT_SERVICE_MIN = int(os.environ.get("DEFAULT_SERVICE_MIN", "10"))
+
+# Лимиты / пауза после 429
+ORS_OPTIM_COOLDOWN_SEC = int(os.environ.get("ORS_OPTIM_COOLDOWN_SEC", "900"))  # 15 минут
+last_ors_429_time = 0  # сюда запоминаем время последнего 429 от ORS
 
 # ⚖️ Масштабирование единиц
 # Теперь считаем объём прямо в м³, а вес прямо в кг
@@ -236,9 +241,6 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 # === Глобальный кэш геокодинга ===
 addr_cache = {}
 
-# === Глобальный кэш геокодинга ===
-addr_cache = {}
-
 def generate_addr_candidates(addr: str) -> list[str]:
     """
     Строит цепочку всё более грубых адресов.
@@ -283,7 +285,6 @@ def generate_addr_candidates(addr: str) -> list[str]:
 
     return variants
 
-
 def _ors_geocode_single(query: str):
     """
     Один запрос к ORS geocode, возвращает (lon, lat) или None.
@@ -317,6 +318,7 @@ def _ors_geocode_single(query: str):
             best = (float(lon), float(lat))
     return best
 
+
 def geocode_address(address: str):
     """
     Многошаговый геокодер ORS:
@@ -326,9 +328,10 @@ def geocode_address(address: str):
       4) при полном провале — координаты склада
     Всегда возвращает (lon, lat).
     """
+    global last_ors_429_time
 
     if not address:
-        logger.error(f"[GEOCODE] Пустой адрес")
+        logger.error("[GEOCODE] Пустой адрес")
         return float(WAREHOUSE_LON), float(WAREHOUSE_LAT)
 
     # базовая чистка
@@ -355,12 +358,19 @@ def geocode_address(address: str):
             return res
         except HTTPError as e:
             status = e.response.status_code if e.response is not None else None
-            # на 5xx просто пробуем следующий вариант адреса
+
+            if status == 429:
+                # Лимит по геокодингу — не мучаем ORS дальше, ставим склад
+                last_ors_429_time = time.time()
+                logger.error(f"[GEOCODE] ORS 429 Too Many Requests для '{cand}'. Ставлю координаты склада.")
+                last_error = e
+                break
+
             if status and 500 <= status < 600:
-                logger.warning(f"[GEOCODE] ORS 5xx на адрес '{cand}': {status}")
+                logger.warning(f"[GEOCODE] ORS 5xx на '{cand}': {status}")
                 last_error = e
                 continue
-            # 4xx или что-то другое — дальше дергать смысла мало
+
             last_error = e
             logger.error(f"[GEOCODE] HTTP {status} для '{cand}', прекращаю попытки")
             break
@@ -441,98 +451,6 @@ def safe_col(df, name):
         logger.warning(f"Колонка '{name}' дублируется, беру первую")
         col = col.iloc[:, 0]
     return col
-
-def _call_ors_raw(payload: dict) -> dict:
-    """
-    Голый вызов ORS optimization с логированием тела ошибки.
-    payload уже должен содержать jobs/vehicles/options.
-    """
-    url = "https://api.openrouteservice.org/optimization"
-    headers = {"Authorization": ORS_API_KEY}
-
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
-
-    if r.status_code >= 400:
-        txt = r.text[:1000]
-        logger.error(f"ORS error {r.status_code}: {txt}")
-        r.raise_for_status()
-
-    return r.json()
-
-def find_bad_jobs(jobs: list[dict], vehicles: list[dict]) -> tuple[list[dict], list[dict]]:
-    """
-    Возвращает (good_jobs, bad_jobs).
-    bad_jobs — минимальный набор заявок, на которых ORS стабильно падает с 5xx.
-    """
-    good, bad = [], []
-
-    def check_subset(sub):
-        payload = {"jobs": sub, "vehicles": vehicles, "options": {"g": True}}
-        payload = prepare_payload_for_ors(payload)
-        return _call_ors_raw(payload)
-
-    def dfs(sub):
-        nonlocal good, bad
-        if not sub:
-            return
-        try:
-            check_subset(sub)
-            # если всё посчиталось — это хороший кусок
-            good.extend(sub)
-        except HTTPError as e:
-            code = e.response.status_code if e.response is not None else None
-            if code and 500 <= code < 600:
-                # серверная ошибка — режем дальше
-                if len(sub) == 1:
-                    bad.extend(sub)
-                else:
-                    mid = len(sub) // 2
-                    dfs(sub[:mid])
-                    dfs(sub[mid:])
-            else:
-                # не 5xx — это уже логический косяк, пусть летит наверх
-                raise
-
-    dfs(jobs)
-    return good, bad
-
-def ors_optimize_safe(jobs, vehicles):
-    """
-    Комбо-вариант:
-      1) пытаемся обычную оптимизацию
-      2) если ORS даёт 5xx — бинарно ищем плохие jobs,
-         выкидываем их и считаем по остальным.
-    Возвращает (solution, bad_jobs_list).
-    """
-    payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
-    payload = prepare_payload_for_ors(payload)
-
-    try:
-        logger.info(f"ORS try: jobs={len(jobs)}, vehicles={len(vehicles)}")
-        sol = _call_ors_raw(payload)
-        return sol, []
-    except HTTPError as e:
-        code = e.response.status_code if e.response is not None else None
-        if not (code and 500 <= code < 600):
-            # не внутренняя ошибка ORS — пробрасываем
-            raise
-
-        logger.warning(f"ORS 5xx на {len(jobs)} заявках. Начинаю поиск проблемных jobs...")
-        good_jobs, bad_jobs = find_bad_jobs(jobs, vehicles)
-
-        if not good_jobs:
-            # вообще ад: ORS падает даже на одной заявке
-            raise RuntimeError("ORS падает даже на минимальном наборе заявок")
-
-        logger.warning(
-            f"Плохих заявок: {len(bad_jobs)}; хороших: {len(good_jobs)}. "
-            f"Оптимизирую только по хорошим."
-        )
-
-        payload2 = {"jobs": good_jobs, "vehicles": vehicles, "options": {"g": True}}
-        payload2 = prepare_payload_for_ors(payload2)
-        sol2 = _call_ors_raw(payload2)
-        return sol2, bad_jobs
 
 def read_excel_flex(path: str, filename: str) -> list[pd.DataFrame]:
     ext = os.path.splitext(filename.lower())[1]
@@ -1265,22 +1183,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or f"id_{user_id}"
 
+    # --- Админ ---
     if user_id == ADMIN_ID:
-        # Постоянное меню для админа (ReplyKeyboard внизу чата)
         reply_keyboard = [
             ["🧭 Оптимизация маршрутов", "📊 Итоги дня"],
             ["📥 Загрузить Excel"]
         ]
         markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+
         await update.message.reply_text(
             f"Привет, админ {username}!\nВыберите действие ниже:",
             reply_markup=markup
         )
-    else:
-        # Меню для водителя (только заработок)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
-        ])
+        return
+
+    # --- Водитель ---
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Мой заработок", callback_data="earnings")]
+    ])
+
     await update.message.reply_text(
         "Укажи параметры машины, например:\n"
         "`2.5, 500, А123ВС78`\n"
@@ -1289,6 +1210,111 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
+
+def _call_ors_raw(payload: dict) -> dict:
+    """
+    Голый вызов ORS optimization с логированием и обработкой 429.
+    payload уже должен содержать jobs/vehicles/options.
+    """
+    global last_ors_429_time
+
+    url = "https://api.openrouteservice.org/optimization"
+    headers = {"Authorization": ORS_API_KEY}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+
+    if r.status_code >= 400:
+        txt = r.text[:1000]
+        logger.error(f"ORS error {r.status_code}: {txt}")
+
+        if r.status_code == 429:
+            last_ors_429_time = time.time()
+            raise RuntimeError(
+                "ORS вернул 429 Too Many Requests (исчерпан лимит запросов на оптимизацию). "
+                "Подождите немного и попробуйте ещё раз."
+            )
+
+        r.raise_for_status()
+
+    return r.json()
+
+
+def find_bad_jobs(jobs: list[dict], vehicles: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Возвращает (good_jobs, bad_jobs).
+    bad_jobs — минимальный набор заявок, на которых ORS стабильно падает с 5xx.
+    """
+    good, bad = [], []
+
+    def check_subset(sub):
+        payload = {"jobs": sub, "vehicles": vehicles, "options": {"g": True}}
+        payload = prepare_payload_for_ors(payload)
+        return _call_ors_raw(payload)
+
+    def dfs(sub):
+        nonlocal good, bad
+        if not sub:
+            return
+        try:
+            check_subset(sub)
+            # если всё посчиталось — это хороший кусок
+            good.extend(sub)
+        except HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code and 500 <= code < 600:
+                # серверная ошибка — режем дальше
+                if len(sub) == 1:
+                    bad.extend(sub)
+                else:
+                    mid = len(sub) // 2
+                    dfs(sub[:mid])
+                    dfs(sub[mid:])
+            else:
+                # не 5xx — это уже логический косяк, пусть летит наверх
+                raise
+
+    dfs(jobs)
+    return good, bad
+
+
+def ors_optimize_safe(jobs, vehicles):
+    """
+    Комбо-вариант:
+      1) пытаемся обычную оптимизацию
+      2) если ORS даёт 5xx — бинарно ищем плохие jobs,
+         выкидываем их и считаем по остальным.
+    Возвращает (solution, bad_jobs_list).
+    """
+    payload = {"jobs": jobs, "vehicles": vehicles, "options": {"g": True}}
+    payload = prepare_payload_for_ors(payload)
+
+    try:
+        logger.info(f"ORS try: jobs={len(jobs)}, vehicles={len(vehicles)}")
+        sol = _call_ors_raw(payload)
+        return sol, []
+    except HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        if not (code and 500 <= code < 600):
+            # не внутренняя ошибка ORS — пробрасываем
+            raise
+
+        logger.warning(f"ORS 5xx на {len(jobs)} заявках. Начинаю поиск проблемных jobs...")
+        good_jobs, bad_jobs = find_bad_jobs(jobs, vehicles)
+
+        if not good_jobs:
+            # совсем ад: ORS падает даже на одной заявке
+            raise RuntimeError("ORS падает даже на минимальном наборе заявок")
+
+        logger.warning(
+            f"Плохих заявок: {len(bad_jobs)}; хороших: {len(good_jobs)}. "
+            f"Оптимизирую только по хорошим."
+        )
+
+        payload2 = {"jobs": good_jobs, "vehicles": vehicles, "options": {"g": True}}
+        payload2 = prepare_payload_for_ors(payload2)
+        sol2 = _call_ors_raw(payload2)
+        return sol2, bad_jobs
+
 
 async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений от администратора."""
@@ -1602,8 +1628,27 @@ async def optimize_and_assign(bot, context=None):
     """
     Строит маршруты без назначения водителя.
     Админ получает список маршрутов и кнопку "Назначить водителя".
-    После выбора водителя маршрут передаётся ему.
+
+    + защита от:
+      - 429 (слишком много запросов)
+      - 5xx внутри ORS (выкидываем ядовитые заявки)
     """
+    global last_ors_429_time
+
+    # проверяем, не было ли недавно 429
+    if last_ors_429_time:
+        delta = time.time() - last_ors_429_time
+        if delta < ORS_OPTIM_COOLDOWN_SEC:
+            wait_min = int((ORS_OPTIM_COOLDOWN_SEC - delta) / 60) + 1
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "❌ ORS недавно вернул 429 (лимит запросов на оптимизацию).\n"
+                    f"Подождите примерно {wait_min} мин и попробуйте ещё раз."
+                ),
+            )
+            return False
+
     try:
         rows = sheet.get_all_records()
     except Exception as e:
@@ -1633,7 +1678,6 @@ async def optimize_and_assign(bot, context=None):
 
     # если были выкинутые заявки — предупреждаем админа
     if bad_jobs:
-        bad_ids = [j["id"] for j in bad_jobs]
         lines = []
         for j in bad_jobs:
             jid = j["id"]
@@ -1642,7 +1686,7 @@ async def optimize_and_assign(bot, context=None):
         msg = (
             "⚠️ Часть заявок исключена из оптимизации, т.к. ORS из-за них падает:\n\n"
             + "\n".join(lines)
-            + "\n\nОни останутся в таблице без маршрута, проверь руками."
+            + "\n\nОни остались в таблице без маршрута, проверь вручную."
         )
         await bot.send_message(chat_id=ADMIN_ID, text=msg)
 
@@ -1726,8 +1770,10 @@ async def optimize_and_assign(bot, context=None):
     if unassigned_ids:
         await bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
-                 f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})"
+            text=(
+                f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
+                f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})"
+            )
         )
     return True
 
@@ -2427,4 +2473,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
