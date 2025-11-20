@@ -880,7 +880,9 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         "plan_dt": ["планвремядата", "доставкa", "дата", "время"],
         "volume":  ["обьемзаказа", "объемзаказа", "обьем", "объем", "volume", "объемм3", "обьемм3", "м3", "м^3"],
         "weight":  ["весзаказа", "вес", "масса"],
-        "qty":     ["количествотовара", "количество"]
+        "qty":     ["количествотовара", "количество"],
+        "phone":   ["телефон", "телефонклиента"],
+        "items":   ["наименование", "списоктоваров", "товар"]
     }
 
     def pick_key(row: dict, keys: list[str]) -> str | None:
@@ -915,9 +917,17 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             if not seen or norm_key(p) != norm_key(seen[-1]):
                 seen.append(p)
         s = ", ".join(seen)
-        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"(кв\.?\s*\S+)|(офис\s*\S+)|(пом\.?\s*\S+)|(лит\.?\s*\S+)|(строение\s*\S+)",
+                   "", s, flags=re.IGNORECASE)
         s = re.sub(r"\s{2,}", " ", s).strip(",; ").strip()
         return s
+
+    def norm_text(x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        s = re.sub(r"[\r\n\t]+", " ", s)
+        return s.strip()
 
     jobs = []
     row_index_by_job_id = {}
@@ -936,6 +946,8 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         k_vol     = pick_key(row, aliases["volume"])
         k_wgt     = pick_key(row, aliases["weight"])
         k_qty     = pick_key(row, aliases["qty"])
+        k_phone   = pick_key(row, aliases["phone"])
+        k_items   = pick_key(row, aliases["items"])
 
         status = str(row.get(k_status, "")).strip().lower() if k_status else ""
         driver_cell = str(row.get(k_driver, "")).strip() if k_driver else ""
@@ -964,7 +976,10 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         try:
             qty_val = as_float(raw_qty, None) if raw_qty is not None else None
             if qty_val is not None and abs(vol_m3 - qty_val) < 1e-9 and vol_m3 > 0 and as_float(raw_vol, None) is None:
-                logger.warning(f"[ROW {idx}] Похоже, подхватили 'Количество товара' вместо 'Объем заказа' -> vol={vol_m3}, qty={qty_val}. Ставлю vol=0.00")
+                logger.warning(
+                    f"[ROW {idx}] Похоже, подхватили 'Количество товара' вместо 'Объем заказа' "
+                    f"-> vol={vol_m3}, qty={qty_val}. Ставлю vol=0.00"
+                )
                 vol_m3 = 0.00
         except Exception:
             pass
@@ -974,6 +989,11 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
         except Exception:
             order_no_raw = ""
         order_no = order_no_raw if order_no_raw else order_no_from_col_A(idx)
+
+        # телефон и что везём
+        phone_raw = norm_text(row.get(k_phone, "")) if k_phone else ""
+        items_raw = norm_text(row.get(k_items, "")) if k_items else ""
+        items_short = items_raw[:100] if items_raw else ""
 
         # ВАЖНО: ORS требует целые числа в amount
         amount_int = [
@@ -1001,10 +1021,17 @@ def build_jobs_from_sheet(rows, start_row_idx=2):
             "vol_m3": vol_m3,
             "wgt_kg": wgt_kg,
             "tw": job.get("time_windows"),
+            "phone": phone_raw,
+            "items_full": items_raw,
+            "items_short": items_short,
             "raw": {"vol": raw_vol, "wgt": raw_wgt, "qty": raw_qty}
         }
 
-        logger.debug(f"[JOB row {idx}] order='{order_no}' raw_vol='{raw_vol}' -> vol={vol_m3:.2f} м³; raw_wgt='{raw_wgt}' -> w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}] amount={amount_int}")
+        logger.debug(
+            f"[JOB row {idx}] order='{order_no}' raw_vol='{raw_vol}' -> vol={vol_m3:.2f} м³; "
+            f"raw_wgt='{raw_wgt}' -> w={wgt_kg:.1f} кг; addr='{addr_for_geo}' loc=[{lon},{lat}] "
+            f"amount={amount_int}, phone='{phone_raw}', items='{items_short}'"
+        )
 
     return jobs, row_index_by_job_id, coords_cache, job_info
 
@@ -1632,8 +1659,15 @@ async def optimize_and_assign(bot, context=None):
     + защита от:
       - 429 (слишком много запросов)
       - 5xx внутри ORS (выкидываем ядовитые заявки)
+
+    ДОПОЛНЕНО:
+      - считаем реальный пробег маршрута в км;
+      - записываем пробег между точками в столбец N (COL_DISTANCE_N) Google Sheets.
     """
-    global last_ors_429_time
+    global last_ors_429_time, prev_leg_km_by_row
+
+    # очищаем кэш расстояний между точками перед новой оптимизацией
+    prev_leg_km_by_row.clear()
 
     # проверяем, не было ли недавно 429
     if last_ors_429_time:
@@ -1667,7 +1701,10 @@ async def optimize_and_assign(bot, context=None):
         return False
 
     if not jobs:
-        await bot.send_message(chat_id=ADMIN_ID, text="❗ Нет заявок для маршрутизации (все назначены/выполнены или без адреса).")
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text="❗ Нет заявок для маршрутизации (все назначены/выполнены или без адреса)."
+        )
         return False
 
     try:
@@ -1704,14 +1741,66 @@ async def optimize_and_assign(bot, context=None):
         store["coords_cache"] = coords_cache
         store["vehicles"] = {int(v["id"]): v for v in vehicles}
 
+    # координаты склада для расчёта пробега
+    try:
+        wh_lat = float(WAREHOUSE_LAT)
+        wh_lon = float(WAREHOUSE_LON)
+    except Exception:
+        wh_lat = wh_lon = None
+        logger.error("⚠️ Неверные координаты склада, пробег посчитать не смогу.")
+
     # формируем маршруты без водителя
     for i, route in enumerate(routes, start=1):
         steps = [s for s in route.get("steps", []) if s.get("type") == "job"]
         route_id = f"route_{i}"
-        total_km = float(route.get("distance", 0)) / 1000.0
 
-        total_vol = sum(job_info[int(s["job"])]["vol_m3"] for s in steps if int(s["job"]) in job_info)
-        total_wgt = sum(job_info[int(s["job"])]["wgt_kg"] for s in steps if int(s["job"]) in job_info)
+        # === РАСЧЁТ ПРОБЕГА МАРШРУТА И ДИСТАНЦИЙ МЕЖДУ ТОЧКАМИ ===
+        total_km = 0.0
+        if wh_lat is not None and steps:
+            prev_lat = wh_lat
+            prev_lon = wh_lon
+
+            for s in steps:
+                jid = int(s["job"])
+                row_idx = row_index_by_job_id.get(jid)
+                if not row_idx:
+                    continue
+                coords = coords_cache.get(row_idx)
+                if not coords:
+                    continue
+                lon, lat = coords  # в кэше (lon, lat)
+                try:
+                    leg_km = _haversine_km(prev_lat, prev_lon, lat, lon)
+                except Exception as e:
+                    logger.error(f"Ошибка расчёта расстояния для строки {row_idx}: {e}")
+                    continue
+
+                leg_km = round(leg_km, 2)
+                total_km += leg_km
+                prev_leg_km_by_row[row_idx] = leg_km
+
+                prev_lat, prev_lon = lat, lon
+
+            # возврат к складу (для пробега маршрута водителя, но не в таблицу)
+            try:
+                back_km = _haversine_km(prev_lat, prev_lon, wh_lat, wh_lon)
+                total_km += back_km
+            except Exception as e:
+                logger.error(f"Ошибка расчёта возврата к складу: {e}")
+
+        total_km = round(total_km, 1)
+
+        # считаем суммарные объём и вес
+        total_vol = sum(
+            job_info[int(s["job"])]["vol_m3"]
+            for s in steps
+            if int(s["job"]) in job_info
+        )
+        total_wgt = sum(
+            job_info[int(s["job"])]["wgt_kg"]
+            for s in steps
+            if int(s["job"]) in job_info
+        )
 
         def _price_from_row(r: dict) -> float:
             for key in ("Стоимость доставки (для расчёта)", "Стоимость доставки"):
@@ -1727,7 +1816,10 @@ async def optimize_and_assign(bot, context=None):
         for s in steps:
             jid = int(s["job"])
             info = job_info.get(jid, {})
-            eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
+            eta_str = (
+                datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M")
+                if s.get("arrival") else ""
+            )
             price_val = 0.0
             row_idx = row_index_by_job_id.get(jid)
             if row_idx:
@@ -1767,12 +1859,21 @@ async def optimize_and_assign(bot, context=None):
         ])
         await bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=kb)
 
+    # после формирования всех маршрутов пишем пробеги по заявкам в столбец N
+    if prev_leg_km_by_row and COL_DISTANCE_N:
+        for row_idx, km in prev_leg_km_by_row.items():
+            try:
+                sheet.update_cell(row_idx, COL_DISTANCE_N, km)
+            except Exception as e:
+                logger.error(f"Не удалось записать расстояние для строки {row_idx}: {e}")
+
     if unassigned_ids:
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=(
                 f"ℹ️ Нераспределено заявок: {len(unassigned_ids)} "
-                f"({', '.join(map(str, unassigned_ids[:10]))}{'…' if len(unassigned_ids) > 10 else ''})"
+                f"({', '.join(map(str, unassigned_ids[:10]))}"
+                f"{'…' if len(unassigned_ids) > 10 else ''})"
             )
         )
     return True
@@ -2146,6 +2247,9 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
     Отправляет маршрут конкретному водителю.
     Данные берём из application.bot_data, а сообщения шлём через context.bot.
     Каждая заявка уходит отдельным сообщением с кнопками.
+    Теперь дополнительно отправляем:
+      • телефон клиента;
+      • первые 100 символов наименования (что везём).
     """
     bot = context.bot
     store = context.application.bot_data
@@ -2161,7 +2265,7 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Нет маршрута для водителя {vid}.")
         return
 
-        # vid здесь трактуем как telegram id, если маршрут был записан через confirm_assign_driver
+    # vid здесь трактуем как telegram id, если маршрут был записан через confirm_assign_driver
     tg_id = vid
 
     # fallback: если по какой-то причине vid – это не tg_id,
@@ -2171,8 +2275,10 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
             ws = client.open(SHEET_NAME).worksheet("Водители")
             records = ws.get_all_records()
             m = next(
-                (r for r in records
-                 if str(r.get("telegram id") or r.get("Telegram ID") or "").strip() == str(vid)),
+                (
+                    r for r in records
+                    if str(r.get("telegram id") or r.get("Telegram ID") or "").strip() == str(vid)
+                ),
                 None
             )
             if m:
@@ -2186,7 +2292,9 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         return
 
     vehicle = vehicles.get(vid, {"description": f"id_{vid}"})
-    header = f"{vehicle.get('description','')}" + (f" | {vehicle.get('car_plate','')}" if vehicle.get("car_plate") else "")
+    header = f"{vehicle.get('description','')}" + (
+        f" | {vehicle.get('car_plate','')}" if vehicle.get("car_plate") else ""
+    )
     await bot.send_message(chat_id=tg_id, text=f"🧭 Ваш маршрут на сегодня ({header}):")
 
     # по каждой заявке — отдельное сообщение с кнопками
@@ -2194,25 +2302,76 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         jid = int(s["job"])
         info = job_info.get(jid, {})
         row_idx = row_index_by_job_id.get(jid)
+
         lat = lon = None
         if row_idx in coords_cache:
             lon, lat = coords_cache[row_idx]
-        eta_str = datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M") if s.get("arrival") else ""
-        text = f"• №{info.get('order_no', jid)} — {info.get('addr','')}" + (f" (ETA {eta_str})" if eta_str else "")
-        kb = build_task_keyboard(lat if lat is not None else None,
-                                 lon if lon is not None else None,
-                                 row_idx if row_idx else 2)
+
+        eta_str = (
+            datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M")
+            if s.get("arrival") else ""
+        )
+
+        order_no = info.get("order_no", jid)
+        addr = info.get("addr", "")
+        phone = info.get("phone", "")
+        items_short = info.get("items_short", "")
+
+        text_parts = []
+        # первая строка: номер + адрес + ETA
+        line1 = f"• №{order_no} — {addr}"
+        if eta_str:
+            line1 += f" (ETA {eta_str})"
+        text_parts.append(line1)
+
+        # телефон, если есть
+        if phone:
+            text_parts.append(f"📞 {phone}")
+
+        # что везём (первые 100 символов)
+        if items_short:
+            text_parts.append(f"📦 {items_short}")
+
+        text = "\n".join(text_parts)
+
+        kb = build_task_keyboard(
+            lat if lat is not None else None,
+            lon if lon is not None else None,
+            row_idx if row_idx else 2
+        )
         try:
-            await bot.send_message(chat_id=tg_id, text=text, reply_markup=kb, disable_web_page_preview=True)
+            await bot.send_message(
+                chat_id=tg_id,
+                text=text,
+                reply_markup=kb,
+                disable_web_page_preview=True
+            )
         except Exception as e:
             logger.error(f"Не отправилась заявка {jid} водителю {vid}: {e}")
 
     # итоговка
-    total_vol_m3 = sum(job_info[int(s["job"])]["vol_m3"] for s in data["steps"] if int(s["job"]) in job_info)
-    total_wgt_kg = sum(job_info[int(s["job"])]["wgt_kg"] for s in data["steps"] if int(s["job"]) in job_info)
-    await bot.send_message(chat_id=tg_id, text=f"Итого: объём {total_vol_m3} м³ / вес {total_wgt_kg} кг\n🛣 Пробег: ~{data['route_km']:.1f} км")
+    total_vol_m3 = sum(
+        job_info[int(s["job"])]["vol_m3"]
+        for s in data["steps"]
+        if int(s["job"]) in job_info
+    )
+    total_wgt_kg = sum(
+        job_info[int(s["job"])]["wgt_kg"]
+        for s in data["steps"]
+        if int(s["job"]) in job_info
+    )
+    await bot.send_message(
+        chat_id=tg_id,
+        text=(
+            f"Итого: объём {total_vol_m3} м³ / вес {total_wgt_kg} кг\n"
+            f"🛣 Пробег: ~{data['route_km']:.1f} км"
+        )
+    )
 
-    await bot.send_message(chat_id=ADMIN_ID, text=f"✅ Маршрут отправлен водителю {header} (id={tg_id}).")
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"✅ Маршрут отправлен водителю {header} (id={tg_id})."
+    )
 
 # === НОВЫЙ БЛОК: ПРОДВИНУТОЕ РЕДАКТИРОВАНИЕ МАРШРУТОВ ===
 
