@@ -768,10 +768,17 @@ def build_import_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
             lambda x: round(parse_num(x, 0.0), 2)
         )
 
-    # --- исправленный фильтр ---
-    # раньше: contains("доставка товара клиенту") — удалял даже частичные совпадения
-    # теперь удаляет только строки, где ВСЯ ячейка = "доставка товара клиенту"
-    mask = ~out["наименование"].str.lower().str.fullmatch("доставка товара клиенту", na=False)
+        # --- исправленный фильтр "Доставка товара клиенту" ---
+    name_norm = (
+        out["наименование"]
+        .astype(str)
+        .str.replace("\u00a0", " ", regex=False)   # убираем неразрывные пробелы
+        .str.replace(r"\s+", " ", regex=True)      # сжимаем все виды пробелов
+        .str.strip()                               # с краёв всё убираем
+        .str.lower()
+    )
+
+    mask = name_norm != "доставка товара клиенту"
     out = out.loc[mask].reset_index(drop=True)
 
     out = out.reset_index(drop=True)
