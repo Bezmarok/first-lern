@@ -2161,25 +2161,25 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Нет маршрута для водителя {vid}.")
         return
 
-    # данные о водителе
-    drv = drivers_data.get(vid) or {}
-    tg_id = None
-    if drv.get("telegram_id"):
-        try:
-            tg_id = int(drv["telegram_id"])
-        except Exception:
-            tg_id = None
+        # vid здесь трактуем как telegram id, если маршрут был записан через confirm_assign_driver
+    tg_id = vid
 
+    # fallback: если по какой-то причине vid – это не tg_id,
+    # пробуем найти в таблице Водители точное совпадение
     if not tg_id:
         try:
             ws = client.open(SHEET_NAME).worksheet("Водители")
             records = ws.get_all_records()
-            # поиск по id в таблице
-            m = next((r for r in records if str(r.get("telegram id","")).strip()), None)
+            m = next(
+                (r for r in records
+                 if str(r.get("telegram id") or r.get("Telegram ID") or "").strip() == str(vid)),
+                None
+            )
             if m:
-                tg_id = int(str(m.get("telegram id") or m.get("Telegram ID") or "0"))
+                tg_id = int(str(m.get("telegram id") or m.get("Telegram ID")))
         except Exception as e:
             logger.error(f"Не удалось найти Telegram ID для водителя {vid}: {e}")
+            tg_id = None
 
     if not tg_id:
         await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ У водителя {vid} нет Telegram ID.")
@@ -2473,6 +2473,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
-
-
