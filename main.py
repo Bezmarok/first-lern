@@ -285,39 +285,82 @@ def generate_addr_candidates(addr: str) -> list[str]:
 
     return variants
 
+# максимальный радиус поиска адресов вокруг склада (метры)
+MAX_GEOCODE_RADIUS_M = int(os.environ.get("MAX_GEOCODE_RADIUS_M", "150000"))  # 150 км
+# жёсткий лимит дистанции для выбранной точки (км)
+MAX_GEOCODE_DIST_KM = float(os.environ.get("MAX_GEOCODE_DIST_KM", "200"))     # 200 км
+
 def _ors_geocode_single(query: str):
     """
     Один запрос к ORS geocode, возвращает (lon, lat) или None.
+
+    Логика:
+      - ищем ТОЛЬКО в круге вокруг склада (boundary.circle)
+      - выбираем ближайшую точку к складу
+      - если она дальше MAX_GEOCODE_DIST_KM — считаем результат бредом и возвращаем None
     """
     url = "https://api.openrouteservice.org/geocode/search"
+
     params = {
         "api_key": ORS_API_KEY,
         "text": query,
         "size": 5,
         "lang": "ru",
         "boundary.country": "RU",
+        # фокус на склад
         "focus.point.lon": WAREHOUSE_LON,
         "focus.point.lat": WAREHOUSE_LAT,
+        # жёсткое ограничение по кругу (СПб + ЛО, без турпоездок)
+        "boundary.circle.lon": WAREHOUSE_LON,
+        "boundary.circle.lat": WAREHOUSE_LAT,
+        "boundary.circle.radius": MAX_GEOCODE_RADIUS_M,
     }
+
     r = requests.get(url, params=params, timeout=8)
     r.raise_for_status()
     data = r.json()
     feats = data.get("features", [])
     if not feats:
+        logger.debug(f"[GEOCODE] '{query}' — ORS ничего не нашёл в круге.")
         return None
 
     wh_lat = float(WAREHOUSE_LAT)
     wh_lon = float(WAREHOUSE_LON)
+
     best = None
     best_dist = float("inf")
+
     for f in feats:
-        lon, lat = f["geometry"]["coordinates"]
-        dist = _haversine_km(wh_lat, wh_lon, float(lat), float(lon))
+        try:
+            lon, lat = f["geometry"]["coordinates"]
+            lat = float(lat)
+            lon = float(lon)
+        except Exception as e:
+            logger.warning(f"[GEOCODE] кривая фича от ORS для '{query}': {e}")
+            continue
+
+        dist = _haversine_km(wh_lat, wh_lon, lat, lon)
         if dist < best_dist:
             best_dist = dist
-            best = (float(lon), float(lat))
-    return best
+            best = (lon, lat)
 
+    # дополнительный sanity-check, даже поверх boundary.circle
+    if best is None:
+        logger.debug(f"[GEOCODE] '{query}' — подходящих точек нет.")
+        return None
+
+    if best_dist > MAX_GEOCODE_DIST_KM:
+        logger.error(
+            f"[GEOCODE] '{query}' нашёлся в {best_dist:.1f} км от склада "
+            f"(>{MAX_GEOCODE_DIST_KM} км). Игнорирую как бредовый результат."
+        )
+        return None
+
+    logger.debug(
+        f"[GEOCODE] '{query}' → {best[1]:.6f},{best[0]:.6f} "
+        f"на расстоянии {best_dist:.1f} км от склада."
+    )
+    return best
 
 def geocode_address(address: str):
     """
@@ -2015,16 +2058,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     store = context.application.bot_data
 
-    # === Оптимизация маршрутов ===
-    if data in ("optimize", "optimize_again"):
-        ok = await optimize_and_assign(context.bot, context)
-        try:
-            if ok:
-                await query.edit_message_text("🔄 Маршруты построены и разосланы админу!")
-            else:
-                await query.edit_message_text("⚠️ Оптимизация не выполнена. См. сообщения выше.")
-        except Exception:
-            pass
+    # --- РЕДАКТИРОВАНИЕ МАРШРУТА ДО НАЗНАЧЕНИЯ ---
+    if data.startswith("edit_unassigned:"):
+        # просто дергаем уже написанную функцию
+        await open_unassigned_route_editor(update, context)
         return
 
     # === Итоги дня (водитель или админ) ===
@@ -2720,4 +2757,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
