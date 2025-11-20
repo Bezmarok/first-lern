@@ -1661,8 +1661,8 @@ async def optimize_and_assign(bot, context=None):
       - 5xx внутри ORS (выкидываем ядовитые заявки)
 
     ДОПОЛНЕНО:
-      - считаем реальный пробег маршрута в км;
-      - записываем пробег между точками в столбец N (COL_DISTANCE_N) Google Sheets.
+      - считаем расстояния между точками и пишем их в столбец N (COL_DISTANCE_N);
+      - общая длина маршрута берётся ИЗ ORS, а расчёт "по прямой" используется как запасной вариант.
     """
     global last_ors_429_time, prev_leg_km_by_row
 
@@ -1741,21 +1741,21 @@ async def optimize_and_assign(bot, context=None):
         store["coords_cache"] = coords_cache
         store["vehicles"] = {int(v["id"]): v for v in vehicles}
 
-    # координаты склада для расчёта пробега
+    # координаты склада для расчёта расстояний между точками
     try:
         wh_lat = float(WAREHOUSE_LAT)
         wh_lon = float(WAREHOUSE_LON)
     except Exception:
         wh_lat = wh_lon = None
-        logger.error("⚠️ Неверные координаты склада, пробег посчитать не смогу.")
+        logger.error("⚠️ Неверные координаты склада, пробег между точками посчитать не смогу.")
 
     # формируем маршруты без водителя
     for i, route in enumerate(routes, start=1):
         steps = [s for s in route.get("steps", []) if s.get("type") == "job"]
         route_id = f"route_{i}"
 
-        # === РАСЧЁТ ПРОБЕГА МАРШРУТА И ДИСТАНЦИЙ МЕЖДУ ТОЧКАМИ ===
-        total_km = 0.0
+        # === РАСЧЁТ РАССТОЯНИЙ МЕЖДУ ТОЧКАМИ (по прямой) ===
+        legs_km_sum = 0.0
         if wh_lat is not None and steps:
             prev_lat = wh_lat
             prev_lon = wh_lon
@@ -1769,6 +1769,7 @@ async def optimize_and_assign(bot, context=None):
                 if not coords:
                     continue
                 lon, lat = coords  # в кэше (lon, lat)
+
                 try:
                     leg_km = _haversine_km(prev_lat, prev_lon, lat, lon)
                 except Exception as e:
@@ -1776,19 +1777,31 @@ async def optimize_and_assign(bot, context=None):
                     continue
 
                 leg_km = round(leg_km, 2)
-                total_km += leg_km
+                legs_km_sum += leg_km
                 prev_leg_km_by_row[row_idx] = leg_km
 
                 prev_lat, prev_lon = lat, lon
 
-            # возврат к складу (для пробега маршрута водителя, но не в таблицу)
+            # возврат к складу (для общей длины маршрута водителя, в таблицу не пишем)
             try:
                 back_km = _haversine_km(prev_lat, prev_lon, wh_lat, wh_lon)
-                total_km += back_km
+                legs_km_sum += round(back_km, 2)
             except Exception as e:
                 logger.error(f"Ошибка расчёта возврата к складу: {e}")
 
-        total_km = round(total_km, 1)
+        legs_km_sum = round(legs_km_sum, 1)
+
+        # общая длина маршрута по данным ORS (по дорогам)
+        route_km = float(route.get("distance", 0)) / 1000.0
+        route_km = round(route_km, 1)
+
+        # подстраховка: если ORS дал ерунду, используем наш расчёт по прямой
+        if (route_km <= 0 or route_km > 1000) and legs_km_sum > 0:
+            logger.warning(
+                f"Ненормальный пробег от ORS ({route_km} км), "
+                f"беру приблизительный по прямой {legs_km_sum} км для маршрута #{i}"
+            )
+            route_km = legs_km_sum
 
         # считаем суммарные объём и вес
         total_vol = sum(
@@ -1838,7 +1851,7 @@ async def optimize_and_assign(bot, context=None):
         if context:
             context.application.bot_data.setdefault("routes_unassigned", {})[route_id] = {
                 "steps": steps,
-                "route_km": total_km,
+                "route_km": route_km,
                 "total_vol": total_vol,
                 "total_wgt": total_wgt,
                 "total_price": total_price,
@@ -1848,7 +1861,7 @@ async def optimize_and_assign(bot, context=None):
             f"🚚 Маршрут #{i}\n"
             f"Заявок: {len(steps)}\n"
             f"Итого: объём {total_vol:.1f} м³ / вес {total_wgt:.1f} кг\n"
-            f"Пробег: ~{total_km:.1f} км\n"
+            f"Пробег: ~{route_km:.1f} км\n"
             f"Сумма заказов: {total_price:.2f} ₽\n\n"
             + ("\n".join(lines) if lines else "Заявок нет")
         )
@@ -2375,6 +2388,73 @@ async def send_route_to_driver(context: ContextTypes.DEFAULT_TYPE, vid: int):
 
 # === НОВЫЙ БЛОК: ПРОДВИНУТОЕ РЕДАКТИРОВАНИЕ МАРШРУТОВ ===
 
+async def open_unassigned_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Редактирование маршрута ДО назначения водителя.
+    Работает с routes_unassigned[route_id], позволяет удалять заявки из маршрута.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    _, route_id = data.split(":", 1)
+
+    store = context.application.bot_data
+    routes_unassigned = store.get("routes_unassigned", {})
+    job_info = store.get("job_info", {})
+
+    route = routes_unassigned.get(route_id)
+    if not route:
+        await query.edit_message_text("⚠️ Маршрут не найден.")
+        return
+
+    steps = route.get("steps", [])
+    if not steps:
+        await query.edit_message_text("ℹ️ В этом маршруте нет заявок.")
+        return
+
+    # текст списка заявок
+    lines = []
+    for s in steps:
+        jid = int(s["job"])
+        info = job_info.get(jid, {})
+        addr = info.get("addr", "Без адреса")
+        eta_str = (
+            datetime.fromtimestamp(s.get("arrival")).strftime("%H:%M")
+            if s.get("arrival") else ""
+        )
+        line = f"• №{info.get('order_no', jid)} — {addr}"
+        if eta_str:
+            line += f" (ETA {eta_str})"
+        lines.append(line)
+
+    route_km = route.get("route_km", 0.0)
+
+    text = (
+        f"✏️ Редактирование маршрута #{route_id}\n\n"
+        f"Заявок: {len(steps)}\n"
+        f"Пробег: ~{route_km:.1f} км\n\n"
+        + "\n".join(lines)
+    )
+    if len(text) > 3900:
+        text = text[:3900] + "\n…(сокращено)"
+
+    # сохраняем в routes_cache, чтобы edit_delete_point и прочие работали
+    routes_cache[route_id] = {"vid": None, "steps": steps}
+
+    kb_rows = []
+    for s in steps:
+        jid = int(s["job"])
+        order_no = job_info.get(jid, {}).get("order_no", jid)
+        kb_rows.append([
+            InlineKeyboardButton(f"🗑 Удалить №{order_no}", callback_data=f"edit_del:{route_id}:{jid}")
+        ])
+
+    kb_rows.append([InlineKeyboardButton("📤 Передать маршрут", callback_data=f"edit_transfer:{route_id}")])
+    kb_rows.append([InlineKeyboardButton("✅ Завершить", callback_data="edit_done")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+
 async def open_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает маршрут водителя и позволяет удалить или передать точки."""
     query = update.callback_query
@@ -2424,7 +2504,7 @@ async def open_route_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def edit_delete_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет точку из маршрута."""
+    """Удаляет точку из маршрута (как для назначенных, так и для не назначенных маршрутов)."""
     query = update.callback_query
     await query.answer()
     _, route_id, jid = query.data.split(":")
@@ -2439,6 +2519,13 @@ async def edit_delete_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
     route["steps"] = [s for s in route["steps"] if int(s["job"]) != jid]
     after = len(route["steps"])
     diff = before - after
+
+    # синхронизируем изменения с routes_unassigned, если маршрут оттуда
+    store = context.application.bot_data
+    routes_unassigned = store.get("routes_unassigned", {})
+    if route_id in routes_unassigned:
+        routes_unassigned[route_id]["steps"] = route["steps"]
+        store["routes_unassigned"] = routes_unassigned
 
     msg = f"❌ Удалено {diff} точек. Осталось {after}."
     kb = [
@@ -2578,6 +2665,7 @@ if __name__ == "__main__":
     #   CALLBACK: РЕДАКТИРОВАНИЕ
     # ============================
     app.add_handler(CallbackQueryHandler(open_route_editor, pattern=r"^edit:"))
+    app.add_handler(CallbackQueryHandler(open_unassigned_route_editor, pattern=r"^edit_unassigned:"))
     app.add_handler(CallbackQueryHandler(edit_delete_point, pattern=r"^edit_del:"))
     app.add_handler(CallbackQueryHandler(edit_done, pattern=r"^edit_done$"))
     app.add_handler(CallbackQueryHandler(edit_transfer_whole_route, pattern=r"^edit_transfer_whole:"))
