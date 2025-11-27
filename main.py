@@ -89,7 +89,7 @@ ORS_API_KEY = os.environ.get("ORS_API_KEY")
 if not ORS_API_KEY:
     raise RuntimeError("Не задана переменная окружения ORS_API_KEY")
 
-ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "260653949"))
+ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "257300241"))
 
 WAREHOUSE_LAT = os.environ.get("WAREHOUSE_LAT", "59.780685")
 WAREHOUSE_LON = os.environ.get("WAREHOUSE_LON", "30.170815")
@@ -2063,6 +2063,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
+    if data == "optimize":
+        ok = await optimize_and_assign(context.bot, context)
+        if ok:
+            await query.edit_message_text("🚀 Оптимизация выполнена. Результаты отправлены.")
+        else:
+            await query.edit_message_text("⚠️ Оптимизация не выполнена. Проверьте сообщения выше.")
+        return
+
     store = context.application.bot_data
 
     # --- РЕДАКТИРОВАНИЕ МАРШРУТА ДО НАЗНАЧЕНИЯ ---
@@ -2764,4 +2772,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
