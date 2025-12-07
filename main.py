@@ -1239,7 +1239,7 @@ def ors_optimize(jobs, vehicles):
     if isinstance(payload, str):
         payload = json.loads(payload)
 
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    r = requests.post(url, headers=headers, json=payload, timeout=300)
     r.raise_for_status()
     return r.json()
 
@@ -1298,7 +1298,7 @@ def _call_ors_raw(payload: dict) -> dict:
     url = "https://api.openrouteservice.org/optimization"
     headers = {"Authorization": ORS_API_KEY}
 
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    r = requests.post(url, headers=headers, json=payload, timeout=300)
 
     if r.status_code >= 400:
         txt = r.text[:1000]
@@ -2772,4 +2772,3 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_driver_params))
 
     app.run_polling()
-
